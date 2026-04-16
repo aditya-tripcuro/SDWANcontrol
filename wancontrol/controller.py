@@ -249,15 +249,15 @@ class Controller:
         # Step 3: Remove lock file
         self._release_master_lock()
 
-        # Step 4: Close database
-        self._db.close()
-
-        # Step 5: Log shutdown event
+        # Step 4: Log shutdown event (must happen before close())
         self._db.log_event(
             level="INFO",
             component="controller",
             message="Controller shutdown complete",
         )
+
+        # Step 5: Close database
+        self._db.close()
 
         logger.info(
             "Controller stopped",
@@ -652,14 +652,17 @@ class Controller:
         Transition WAN state based on new metric. Use match statement.
 
         Transitions:
-        STABLE   → DEGRADED  : score dropped but not hard_fail
+        STABLE   → DEGRADED  : score dropped below degraded_threshold but not hard_fail
         STABLE   → FAILED    : is_hard_fail
-        DEGRADED → STABLE    : score recovered above hard_fail_threshold
+        DEGRADED → STABLE    : score recovered above degraded_threshold
         DEGRADED → FAILED    : is_hard_fail
         FAILED   → DEGRADED  : score recovered above hard_fail_threshold
                                (not directly to STABLE — must prove stability)
         FAILED   → FAILED    : still hard_fail (no-op)
         SWITCHING → STABLE   : after route change completes
+
+        degraded_threshold = hard_fail_threshold + hysteresis_switch_to_backup
+                             + recovery_margin
 
         On STABLE→FAILED or DEGRADED→FAILED: fire link_down alert
         On FAILED→DEGRADED: fire link_up alert (recovered but not stable yet)
@@ -668,12 +671,21 @@ class Controller:
         old_state = iface_state.wan_state
         new_state: WanState
 
+        # An interface is STABLE only when its score is comfortably above
+        # the hard-fail floor, accounting for switch hysteresis and recovery
+        # margin.  Scores below this threshold indicate degraded performance.
+        degraded_threshold = (
+            self._cfg.scoring.hard_fail_threshold
+            + self._cfg.scoring.hysteresis_switch_to_backup
+            + self._cfg.scoring.recovery_margin
+        )
+
         # Determine new state based on current state and metric
         match old_state:
             case WanState.STABLE:
                 if metric.is_hard_fail:
                     new_state = WanState.FAILED
-                elif metric.score < self._cfg.scoring.hard_fail_threshold:
+                elif metric.score < degraded_threshold:
                     new_state = WanState.DEGRADED
                 else:
                     new_state = WanState.STABLE
@@ -681,7 +693,7 @@ class Controller:
             case WanState.DEGRADED:
                 if metric.is_hard_fail:
                     new_state = WanState.FAILED
-                elif metric.score >= self._cfg.scoring.hard_fail_threshold:
+                elif metric.score >= degraded_threshold:
                     new_state = WanState.STABLE
                 else:
                     new_state = WanState.DEGRADED

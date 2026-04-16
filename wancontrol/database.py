@@ -258,6 +258,19 @@ class Database:
         self._path = Path(db_path)
         self._local = threading.local()
         self._write_lock = threading.Lock()  # serialise writes across threads
+        # In-memory databases use a single persistent connection shared across
+        # threads so that close() → reconnect does not destroy schema and data.
+        # WAL mode is not supported for :memory:; foreign_keys and synchronous
+        # are still applied.  Thread safety for concurrent access is provided
+        # by _write_lock (writes) and SQLite's internal serialised locking.
+        self._mem_conn: sqlite3.Connection | None = None
+        if str(db_path) == ":memory:":
+            self._mem_conn = sqlite3.connect(
+                ":memory:", check_same_thread=False, isolation_level=None
+            )
+            self._mem_conn.execute("PRAGMA foreign_keys=ON")
+            self._mem_conn.execute("PRAGMA synchronous=NORMAL")
+            self._mem_conn.row_factory = sqlite3.Row
 
     # ── Setup ──────────────────────────────────────────────────────────────
 
@@ -713,7 +726,18 @@ class Database:
 
         Call this from each thread before it exits, and from the main thread
         on SIGTERM/SIGINT to ensure clean shutdown. Safe to call multiple times.
+
+        For :memory: databases the persistent connection is intentionally kept
+        open so that callers can still query the database after close().
         """
+        if self._mem_conn is not None:
+            # Keep the in-memory connection alive — closing it would destroy
+            # all data and schema, making subsequent queries fail.
+            logger.debug(
+                "close() skipped for in-memory database",
+                extra={"component": "database"},
+            )
+            return
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             try:
@@ -774,19 +798,23 @@ class Database:
             default ``BEGIN`` (deferred).  Use for IPC-safe key-value state
             access shared between Master and Standby processes.
         """
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(
-                str(self._path),
-                check_same_thread=False,
-                isolation_level=None,  # autocommit; we manage transactions manually
-            )
-            # PRAGMAs must be set outside any transaction.
-            self._local.conn.execute("PRAGMA journal_mode=WAL")
-            self._local.conn.execute("PRAGMA foreign_keys=ON")
-            self._local.conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.conn.row_factory = sqlite3.Row
-
-        conn = self._local.conn
+        # In-memory databases share a single persistent connection; file-based
+        # databases use a per-thread connection via threading.local().
+        if self._mem_conn is not None:
+            conn = self._mem_conn
+        else:
+            if not hasattr(self._local, "conn") or self._local.conn is None:
+                self._local.conn = sqlite3.connect(
+                    str(self._path),
+                    check_same_thread=False,
+                    isolation_level=None,  # autocommit; we manage transactions manually
+                )
+                # PRAGMAs must be set outside any transaction.
+                self._local.conn.execute("PRAGMA journal_mode=WAL")
+                self._local.conn.execute("PRAGMA foreign_keys=ON")
+                self._local.conn.execute("PRAGMA synchronous=NORMAL")
+                self._local.conn.row_factory = sqlite3.Row
+            conn = self._local.conn
         try:
             # If the caller is already inside a transaction (e.g. nested _conn
             # calls), just yield without opening another BEGIN.
