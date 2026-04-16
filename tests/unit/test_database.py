@@ -124,8 +124,10 @@ class TestMetrics:
         mem_db.insert_metric("wan0", 5.0, 0.5, 0.0, True, False, 88.0)
         row = mem_db.get_latest_metric("wan0")
         assert row is not None
-        assert bool(row.dns_ok) is True
-        assert bool(row.http_ok) is False
+        assert isinstance(row.dns_ok, bool)
+        assert isinstance(row.http_ok, bool)
+        assert row.dns_ok is True
+        assert row.http_ok is False
 
 
 # ── SWITCH EVENTS ─────────────────────────────────────────────────────────────
@@ -297,7 +299,8 @@ class TestUsers:
         mem_db.deactivate_user(uid)
         row = mem_db.get_user_by_id(uid)
         assert row is not None
-        assert not row.is_active
+        assert isinstance(row.is_active, bool)
+        assert row.is_active is False
 
     def test_count_users(self, mem_db: Database) -> None:
         assert mem_db.count_users() == 0
@@ -349,7 +352,8 @@ class TestApiTokens:
         self.db.revoke_api_token(tid)
         row = self.db.get_api_token_by_hash("revoke_hash")
         assert row is not None
-        assert bool(row.is_revoked) is True
+        assert isinstance(row.is_revoked, bool)
+        assert row.is_revoked is True
 
     def test_list_api_tokens_filtered_by_user(self) -> None:
         uid2 = _make_user(self.db, "other_user")
@@ -380,7 +384,8 @@ class TestAlerts:
         mem_db.mark_alert_notified(aid)
         alerts = mem_db.get_recent_alerts()
         alert = next(a for a in alerts if a.id == aid)
-        assert bool(alert.notified) is True
+        assert isinstance(alert.notified, bool)
+        assert alert.notified is True
 
     def test_resolve_alert_sets_resolved_at(self, mem_db: Database) -> None:
         aid = mem_db.insert_alert("ERROR", "Down", "wan1 failed")

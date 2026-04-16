@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python -m pytest tests/unit/test_config.py tests/unit/test_database.py -v --tb=short)",
       "Bash(python -m pytest tests/unit/test_config.py tests/unit/test_database.py -v --tb=short --cov=wancontrol --cov-report=term-missing)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(pip install *)"
     ]
   }
 }
