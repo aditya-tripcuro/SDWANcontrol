@@ -1,15 +1,14 @@
-```
 # Coverage reports
 .coverage
+.coverage.*
 coverage/
 htmlcov/
 
-# Python specific
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
 *.so
 *.egg-info/
 .eggs/
@@ -31,4 +30,3 @@ ENV/
 # OS generated files
 .DS_Store
 Thumbs.db
-```
