@@ -1,0 +1,6 @@
+# Runtime
+PyYAML==6.0.2
+
+# Dev / test only
+pytest==8.3.4
+pytest-cov==5.0.0

@@ -1,0 +1,103 @@
+# WANControl v2 Configuration
+# Run 'python -m wancontrol.discover' to auto-detect interfaces and generate this file.
+# All values are hot-reloadable via SIGHUP or POST /api/config/reload (except db_path).
+
+# ── WAN Interfaces ────────────────────────────────────────────────────────────
+interfaces:
+  - name: "wan0"
+    label: "Fiber Primary"
+    expected_speed_mbps: 100
+    gateway: "192.168.1.1"
+    routing_table_id: 100
+
+  - name: "wan1"
+    label: "BSNL Backup"
+    expected_speed_mbps: 30
+    gateway: "10.0.0.1"
+    routing_table_id: 101
+
+# ── WAN Mode ──────────────────────────────────────────────────────────────────
+# failover     : One active WAN at a time; switch on failure.
+# load_balance : All healthy WANs active; weighted by expected_speed_mbps.
+#                Per-connection distribution (not per-packet).
+#                Bandwidth degrades gracefully when a WAN fails.
+wan_mode: "load_balance"
+
+# ── Probes ────────────────────────────────────────────────────────────────────
+probes:
+  interval_sec: 1
+  dns_targets:
+    - "8.8.8.8"
+    - "1.1.1.1"
+    - "9.9.9.9"
+  icmp_targets:
+    - "8.8.8.8"
+    - "1.1.1.1"
+    - "94.140.14.14"
+  http_targets:
+    - "http://connectivitycheck.gstatic.com/generate_204"
+    - "http://detectportal.firefox.com/success.txt"
+  icmp_count: 5
+  icmp_timeout_sec: 3
+  dns_timeout_sec: 3
+  http_timeout_sec: 5
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
+scoring:
+  latency_penalty_per_ms: 0.3
+  loss_penalty_per_percent: 2.0
+  dns_fail_penalty: 15
+  http_fail_penalty: 20
+  hard_fail_threshold: 20
+  # failover mode only:
+  hysteresis_switch_to_backup: 25
+  hysteresis_return_to_primary: 10
+  # load_balance mode only:
+  # Interface is removed from nexthop set when score < hard_fail_threshold
+  # and re-added when score recovers above hard_fail_threshold + recovery_margin
+  recovery_margin: 10
+
+# ── Controller ────────────────────────────────────────────────────────────────
+controller:
+  loop_interval_sec: 1
+  benchmark_interval_sec: 300
+  metric_collection_timeout_sec: 8
+  heartbeat_interval_sec: 5
+  heartbeat_stale_sec: 15
+
+# ── Data Retention ────────────────────────────────────────────────────────────
+retention:
+  metrics_hours: 72
+  events_days: 30
+  prune_interval_min: 60
+
+# ── Alerting ──────────────────────────────────────────────────────────────────
+alerting:
+  enabled: true
+  webhooks:
+    - url: "http://your-ntfy-server/wancontrol"
+      method: POST
+      headers:
+        Title: "WANControl Alert"
+      on_events:
+        - "link_down"
+        - "link_up"
+        - "gateway_switch"
+        - "interface_added_to_pool"
+        - "interface_removed_from_pool"
+        - "controller_error"
+
+# ── Web Server ────────────────────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"
+  port: 5000
+  # CHANGE THIS before production use:
+  secret_key: "CHANGE_THIS_TO_A_RANDOM_STRING_MIN_32_CHARS"
+  jwt_expiry_hours: 24
+  session_timeout_minutes: 60
+
+# ── File Paths ────────────────────────────────────────────────────────────────
+lock_file: "/run/wancontrol/controller.lock"
+heartbeat_file: "/run/wancontrol/controller.heartbeat"
+db_path: "/var/lib/wancontrol/wan.db"
+log_dir: "/var/lib/wancontrol/logs"

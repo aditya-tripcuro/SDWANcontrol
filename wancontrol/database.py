@@ -1,0 +1,749 @@
+"""
+wancontrol/database.py
+~~~~~~~~~~~~~~~~~~~~~~
+SQLite data layer. WAL mode, versioned migrations, retention policies.
+
+All writes use parameterized queries. Multi-row writes use transactions.
+Inter-process state reads/writes use BEGIN EXCLUSIVE to prevent races
+between Master and Standby processes.
+
+Usage::
+
+    db = Database("/var/lib/wancontrol/wan.db")
+    db.initialize()   # runs migrations, sets WAL mode
+
+    db.insert_metric("wan0", latency_ms=12.3, jitter_ms=1.1,
+                     loss_pct=0.0, dns_ok=True, http_ok=True, score=95.0)
+
+    db.set_state("active_interface", "wan0")
+    iface = db.get_state("active_interface")
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Generator
+
+logger = logging.getLogger(__name__)
+
+# ── Schema version ────────────────────────────────────────────────────────────
+
+CURRENT_SCHEMA_VERSION = 1
+
+# ── Row dataclasses ───────────────────────────────────────────────────────────
+
+@dataclass
+class MetricRow:
+    id: int
+    interface: str
+    timestamp: float
+    latency_ms: float
+    jitter_ms: float
+    loss_pct: float
+    dns_ok: bool
+    http_ok: bool
+    score: float
+
+
+@dataclass
+class SwitchEventRow:
+    id: int
+    timestamp: float
+    from_interface: str
+    to_interface: str
+    reason: str
+    triggered_by: str
+    score_before: float
+    score_after: float
+
+
+@dataclass
+class ControllerEventRow:
+    id: int
+    timestamp: float
+    level: str
+    component: str
+    message: str
+    user_id: int | None
+
+
+@dataclass
+class UserRow:
+    id: int
+    username: str
+    password_hash: str
+    role: str
+    created_at: float
+    last_login: float | None
+    is_active: bool
+
+
+@dataclass
+class ApiTokenRow:
+    id: int
+    user_id: int
+    token_hash: str
+    label: str
+    created_at: float
+    last_used: float | None
+    expires_at: float | None
+    is_revoked: bool
+
+
+@dataclass
+class AlertRow:
+    id: int
+    timestamp: float
+    level: str
+    title: str
+    body: str
+    resolved_at: float | None
+    notified: bool
+
+
+@dataclass
+class DbStats:
+    file_size_bytes: int
+    metrics_count: int
+    switch_events_count: int
+    controller_events_count: int
+    alerts_count: int
+    users_count: int
+    schema_version: int
+
+
+# ── Migrations ────────────────────────────────────────────────────────────────
+
+MIGRATIONS: dict[int, str] = {
+    1: """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version     INTEGER PRIMARY KEY,
+            applied_at  REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS metrics (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            interface   TEXT    NOT NULL,
+            timestamp   REAL    NOT NULL,
+            latency_ms  REAL    NOT NULL,
+            jitter_ms   REAL    NOT NULL,
+            loss_pct    REAL    NOT NULL,
+            dns_ok      INTEGER NOT NULL,
+            http_ok     INTEGER NOT NULL,
+            score       REAL    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_metrics_iface_ts
+            ON metrics(interface, timestamp DESC);
+
+        CREATE TABLE IF NOT EXISTS switch_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       REAL    NOT NULL,
+            from_interface  TEXT    NOT NULL,
+            to_interface    TEXT    NOT NULL,
+            reason          TEXT    NOT NULL,
+            triggered_by    TEXT    NOT NULL DEFAULT 'controller',
+            score_before    REAL    NOT NULL,
+            score_after     REAL    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_switch_events_ts
+            ON switch_events(timestamp DESC);
+
+        CREATE TABLE IF NOT EXISTS controller_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   REAL    NOT NULL,
+            level       TEXT    NOT NULL,
+            component   TEXT    NOT NULL,
+            message     TEXT    NOT NULL,
+            user_id     INTEGER REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ctrl_events_ts
+            ON controller_events(timestamp DESC);
+
+        CREATE TABLE IF NOT EXISTS state (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            updated_at  REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS users (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            username        TEXT    NOT NULL UNIQUE,
+            password_hash   TEXT    NOT NULL,
+            role            TEXT    NOT NULL DEFAULT 'viewer',
+            created_at      REAL    NOT NULL,
+            last_login      REAL,
+            is_active       INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL REFERENCES users(id),
+            token_hash  TEXT    NOT NULL UNIQUE,
+            label       TEXT    NOT NULL,
+            created_at  REAL    NOT NULL,
+            last_used   REAL,
+            expires_at  REAL,
+            is_revoked  INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_tokens_hash
+            ON api_tokens(token_hash);
+
+        CREATE TABLE IF NOT EXISTS alerts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   REAL    NOT NULL,
+            level       TEXT    NOT NULL,
+            title       TEXT    NOT NULL,
+            body        TEXT    NOT NULL,
+            resolved_at REAL,
+            notified    INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_alerts_ts
+            ON alerts(timestamp DESC);
+    """,
+}
+
+
+# ── Database class ────────────────────────────────────────────────────────────
+
+class Database:
+    """
+    Thread-safe SQLite wrapper.
+
+    A single Database instance may be shared across threads; each
+    operation acquires a short-lived connection from the pool (one
+    per thread via threading.local).
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self._path = Path(db_path)
+        self._local = threading.local()
+        self._write_lock = threading.Lock()  # serialise writes across threads
+
+    # ── Setup ──────────────────────────────────────────────────────────────
+
+    def initialize(self) -> None:
+        """Create DB file, enable WAL, run pending migrations. Call once at startup."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        # PRAGMAs are set by _conn() on first connection creation (outside any
+        # transaction); calling them again inside a BEGIN would raise OperationalError.
+        self._run_migrations()
+        logger.info(
+            "Database initialized",
+            extra={"component": "database", "path": str(self._path)},
+        )
+
+    # ── Metrics ────────────────────────────────────────────────────────────
+
+    def insert_metric(
+        self,
+        interface: str,
+        latency_ms: float,
+        jitter_ms: float,
+        loss_pct: float,
+        dns_ok: bool,
+        http_ok: bool,
+        score: float,
+        timestamp: float | None = None,
+    ) -> None:
+        """Insert a single metric row."""
+        ts = timestamp or time.time()
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO metrics
+                    (interface, timestamp, latency_ms, jitter_ms, loss_pct,
+                     dns_ok, http_ok, score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (interface, ts, latency_ms, jitter_ms, loss_pct,
+                 int(dns_ok), int(http_ok), score),
+            )
+
+    def get_metrics(
+        self,
+        interface: str | None = None,
+        limit: int = 200,
+        since: float | None = None,
+    ) -> list[MetricRow]:
+        """Fetch recent metrics, optionally filtered by interface and time window."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if interface:
+            clauses.append("interface = ?")
+            params.append(interface)
+        if since:
+            clauses.append("timestamp >= ?")
+            params.append(since)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, interface, timestamp, latency_ms, jitter_ms, "
+                f"loss_pct, dns_ok, http_ok, score "
+                f"FROM metrics {where} ORDER BY timestamp DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [MetricRow(*r) for r in rows]
+
+    def get_latest_metric(self, interface: str) -> MetricRow | None:
+        """Return the most recent metric for one interface."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, interface, timestamp, latency_ms, jitter_ms, "
+                "loss_pct, dns_ok, http_ok, score "
+                "FROM metrics WHERE interface = ? ORDER BY timestamp DESC LIMIT 1",
+                (interface,),
+            ).fetchone()
+        return MetricRow(*row) if row else None
+
+    # ── Switch events ──────────────────────────────────────────────────────
+
+    def insert_switch_event(
+        self,
+        from_interface: str,
+        to_interface: str,
+        reason: str,
+        score_before: float,
+        score_after: float,
+        triggered_by: str = "controller",
+        timestamp: float | None = None,
+    ) -> None:
+        ts = timestamp or time.time()
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO switch_events
+                    (timestamp, from_interface, to_interface, reason,
+                     triggered_by, score_before, score_after)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ts, from_interface, to_interface, reason,
+                 triggered_by, score_before, score_after),
+            )
+        logger.info(
+            "Switch event recorded: %s → %s (%s)",
+            from_interface, to_interface, reason,
+            extra={"component": "database"},
+        )
+
+    def get_switch_events(self, limit: int = 50) -> list[SwitchEventRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, timestamp, from_interface, to_interface, reason, "
+                "triggered_by, score_before, score_after "
+                "FROM switch_events ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [SwitchEventRow(*r) for r in rows]
+
+    # ── Controller events ──────────────────────────────────────────────────
+
+    def log_event(
+        self,
+        level: str,
+        component: str,
+        message: str,
+        user_id: int | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        """Append a controller event. level: DEBUG | INFO | WARNING | ERROR | CRITICAL"""
+        ts = timestamp or time.time()
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO controller_events
+                    (timestamp, level, component, message, user_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (ts, level.upper(), component, message, user_id),
+            )
+
+    def get_events(
+        self,
+        limit: int = 100,
+        level: str | None = None,
+    ) -> list[ControllerEventRow]:
+        params: list[Any] = []
+        where = ""
+        if level:
+            where = "WHERE level = ?"
+            params.append(level.upper())
+        params.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, timestamp, level, component, message, user_id "
+                f"FROM controller_events {where} ORDER BY timestamp DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [ControllerEventRow(*r) for r in rows]
+
+    # ── State (key-value, exclusive for IPC) ──────────────────────────────
+
+    def set_state(self, key: str, value: str) -> None:
+        """Write a state value. Uses BEGIN EXCLUSIVE to prevent IPC races."""
+        with self._write_lock, self._conn(exclusive=True) as conn:
+            conn.execute(
+                "INSERT INTO state(key, value, updated_at) VALUES(?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (key, value, time.time()),
+            )
+
+    def get_state(self, key: str, default: str | None = None) -> str | None:
+        """Read a state value. Uses BEGIN EXCLUSIVE to prevent IPC races."""
+        with self._conn(exclusive=True) as conn:
+            row = conn.execute(
+                "SELECT value FROM state WHERE key = ?", (key,)
+            ).fetchone()
+        return row[0] if row else default
+
+    def get_all_state(self) -> dict[str, str]:
+        with self._conn() as conn:
+            rows = conn.execute("SELECT key, value FROM state").fetchall()
+        return dict(rows)
+
+    # ── Users ──────────────────────────────────────────────────────────────
+
+    def create_user(
+        self,
+        username: str,
+        password_hash: str,
+        role: str,
+    ) -> int:
+        with self._write_lock, self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO users(username, password_hash, role, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (username, password_hash, role, time.time()),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def get_user_by_username(self, username: str) -> UserRow | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, username, password_hash, role, created_at, "
+                "last_login, is_active FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+        return UserRow(*row) if row else None
+
+    def get_user_by_id(self, user_id: int) -> UserRow | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, username, password_hash, role, created_at, "
+                "last_login, is_active FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        return UserRow(*row) if row else None
+
+    def list_users(self) -> list[UserRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, username, password_hash, role, created_at, "
+                "last_login, is_active FROM users ORDER BY created_at"
+            ).fetchall()
+        return [UserRow(*r) for r in rows]
+
+    def update_user_password(self, user_id: int, password_hash: str) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (password_hash, user_id),
+            )
+
+    def update_user_last_login(self, user_id: int) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE users SET last_login = ? WHERE id = ?",
+                (time.time(), user_id),
+            )
+
+    def update_user_role(self, user_id: int, role: str) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE users SET role = ? WHERE id = ?",
+                (role, user_id),
+            )
+
+    def deactivate_user(self, user_id: int) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE users SET is_active = 0 WHERE id = ?",
+                (user_id,),
+            )
+
+    def count_users(self) -> int:
+        with self._conn() as conn:
+            return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    # ── API Tokens ─────────────────────────────────────────────────────────
+
+    def create_api_token(
+        self,
+        user_id: int,
+        token_hash: str,
+        label: str,
+        expires_at: float | None,
+    ) -> int:
+        with self._write_lock, self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO api_tokens(user_id, token_hash, label, created_at, expires_at) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (user_id, token_hash, label, time.time(), expires_at),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def get_api_token_by_hash(self, token_hash: str) -> ApiTokenRow | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, user_id, token_hash, label, created_at, "
+                "last_used, expires_at, is_revoked "
+                "FROM api_tokens WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        return ApiTokenRow(*row) if row else None
+
+    def touch_api_token(self, token_id: int) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE api_tokens SET last_used = ? WHERE id = ?",
+                (time.time(), token_id),
+            )
+
+    def revoke_api_token(self, token_id: int) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE api_tokens SET is_revoked = 1 WHERE id = ?",
+                (token_id,),
+            )
+
+    def list_api_tokens(self, user_id: int | None = None) -> list[ApiTokenRow]:
+        params: list[Any] = []
+        where = ""
+        if user_id is not None:
+            where = "WHERE user_id = ?"
+            params.append(user_id)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, user_id, token_hash, label, created_at, "
+                f"last_used, expires_at, is_revoked "
+                f"FROM api_tokens {where} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+        return [ApiTokenRow(*r) for r in rows]
+
+    # ── Alerts ─────────────────────────────────────────────────────────────
+
+    def insert_alert(
+        self,
+        level: str,
+        title: str,
+        body: str,
+        timestamp: float | None = None,
+    ) -> int:
+        ts = timestamp or time.time()
+        with self._write_lock, self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO alerts(timestamp, level, title, body) VALUES(?, ?, ?, ?)",
+                (ts, level, title, body),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def mark_alert_notified(self, alert_id: int) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE alerts SET notified = 1 WHERE id = ?", (alert_id,)
+            )
+
+    def resolve_alert(self, alert_id: int) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE alerts SET resolved_at = ? WHERE id = ?",
+                (time.time(), alert_id),
+            )
+
+    def get_unnotified_alerts(self) -> list[AlertRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, timestamp, level, title, body, resolved_at, notified "
+                "FROM alerts WHERE notified = 0 ORDER BY timestamp"
+            ).fetchall()
+        return [AlertRow(*r) for r in rows]
+
+    def get_recent_alerts(self, limit: int = 20) -> list[AlertRow]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, timestamp, level, title, body, resolved_at, notified "
+                "FROM alerts ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [AlertRow(*r) for r in rows]
+
+    # ── Retention / pruning ────────────────────────────────────────────────
+
+    def prune_old_data(
+        self,
+        metrics_hours: int,
+        events_days: int,
+    ) -> dict[str, int]:
+        """
+        Delete rows older than retention thresholds.
+        Returns dict of {table: rows_deleted}.
+        """
+        now = time.time()
+        metrics_cutoff = now - (metrics_hours * 3600)
+        events_cutoff = now - (events_days * 86400)
+
+        deleted: dict[str, int] = {}
+        with self._write_lock, self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM metrics WHERE timestamp < ?", (metrics_cutoff,)
+            )
+            deleted["metrics"] = cur.rowcount
+
+            cur = conn.execute(
+                "DELETE FROM controller_events WHERE timestamp < ?", (events_cutoff,)
+            )
+            deleted["controller_events"] = cur.rowcount
+
+            cur = conn.execute(
+                "DELETE FROM switch_events WHERE timestamp < ?", (events_cutoff,)
+            )
+            deleted["switch_events"] = cur.rowcount
+
+            cur = conn.execute(
+                "DELETE FROM alerts WHERE timestamp < ? AND resolved_at IS NOT NULL",
+                (events_cutoff,),
+            )
+            deleted["alerts"] = cur.rowcount
+
+        total = sum(deleted.values())
+        if total > 0:
+            logger.info(
+                "Pruned %d rows: %s",
+                total, deleted,
+                extra={"component": "database"},
+            )
+        return deleted
+
+    def flush_all_data(self) -> None:
+        """Delete all metrics and events. Preserves users, state, and schema."""
+        with self._write_lock, self._conn() as conn:
+            conn.execute("DELETE FROM metrics")
+            conn.execute("DELETE FROM controller_events")
+            conn.execute("DELETE FROM switch_events")
+            conn.execute("DELETE FROM alerts")
+        logger.warning("All metrics and events flushed", extra={"component": "database"})
+
+    # ── Stats ──────────────────────────────────────────────────────────────
+
+    def get_db_stats(self) -> DbStats:
+        """Return row counts and file size for the dashboard."""
+        with self._conn() as conn:
+            def count(table: str) -> int:
+                return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+            version_row = conn.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()
+            version = version_row[0] if version_row and version_row[0] else 0
+
+        file_size = self._path.stat().st_size if self._path.exists() else 0
+
+        return DbStats(
+            file_size_bytes=file_size,
+            metrics_count=count("metrics"),
+            switch_events_count=count("switch_events"),
+            controller_events_count=count("controller_events"),
+            alerts_count=count("alerts"),
+            users_count=count("users"),
+            schema_version=version,
+        )
+
+    # ── Migrations ─────────────────────────────────────────────────────────
+
+    def _run_migrations(self) -> None:
+        with self._write_lock, self._conn() as conn:
+            # schema_version table might not exist yet
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)"
+            )
+            applied = {
+                r[0] for r in conn.execute("SELECT version FROM schema_version").fetchall()
+            }
+
+        for version, sql in sorted(MIGRATIONS.items()):
+            if version in applied:
+                continue
+            logger.info(
+                "Applying migration v%d", version, extra={"component": "database"}
+            )
+            with self._write_lock, self._conn() as conn:
+                conn.executescript(sql)
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES(?, ?)",
+                    (version, time.time()),
+                )
+            logger.info(
+                "Migration v%d applied", version, extra={"component": "database"}
+            )
+
+    # ── Connection management ──────────────────────────────────────────────
+
+    @contextmanager
+    def _conn(self, exclusive: bool = False) -> Generator[sqlite3.Connection, None, None]:
+        """
+        Return a per-thread SQLite connection with manual transaction management.
+        The connection is reused across calls within the same thread.
+
+        Parameters
+        ----------
+        exclusive:
+            When True, starts a ``BEGIN EXCLUSIVE`` transaction instead of the
+            default ``BEGIN`` (deferred).  Use for IPC-safe key-value state
+            access shared between Master and Standby processes.
+        """
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            self._local.conn = sqlite3.connect(
+                str(self._path),
+                check_same_thread=False,
+                isolation_level=None,  # autocommit; we manage transactions manually
+            )
+            # PRAGMAs must be set outside any transaction.
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA foreign_keys=ON")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn.row_factory = sqlite3.Row
+
+        conn = self._local.conn
+        try:
+            # If the caller is already inside a transaction (e.g. nested _conn
+            # calls), just yield without opening another BEGIN.
+            if conn.in_transaction:
+                yield conn
+            else:
+                begin = "BEGIN EXCLUSIVE" if exclusive else "BEGIN"
+                conn.execute(begin)
+                try:
+                    yield conn
+                    # executescript() issues an implicit COMMIT; guard before
+                    # trying to commit again to avoid OperationalError.
+                    if conn.in_transaction:
+                        conn.execute("COMMIT")
+                except sqlite3.Error:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            logger.error(
+                "SQLite error: %s", exc, extra={"component": "database"}
+            )
+            raise
