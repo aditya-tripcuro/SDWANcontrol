@@ -1,58 +1,34 @@
-```
-# Python
-__pycache__/
+# Compiled Python files
 *.pyc
-*.pyo
-*.pyd
-.Python
-env/
+__pycache__/
+
+# Virtual environments
 venv/
 .venv/
-.eggs/
-.egg-info/
-
-# Testing
-.coverage
-htmlcov/
-.coverage.*
-.noserc
-.tox/
-
-# Database
-*.sqlite
-*.db
+.env
+.env.local
+*.env.*
 
 # Logs
 *.log
 
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
+# Editor/IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
 *.tmp
 
-# Environment
-.env
-.env.local
-*.env.*
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
 
-# Build and distribution
+# Test cache
+.pytest_cache/
+.mypy_cache/
+
+# Distribution artifacts
 dist/
 build/
 *.egg-info/
-*.so
-*.dylib
-*.dll
-*.exe
-*.out
-
-# Cache
-.mypy_cache/
-.pytest_cache/
-.hypothesis/
-```
