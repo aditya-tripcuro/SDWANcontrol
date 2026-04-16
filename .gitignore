@@ -27,7 +27,6 @@ coverage.xml
 # Testing
 .tests/
 test/
-tests/
 
 # Distribution / packaging
 .Python
