@@ -158,6 +158,14 @@ def _require_non_negative(d: dict, key: str, section: str) -> float:
     return val
 
 
+def _require_number(d: dict, key: str, section: str) -> float:
+    """Require the key exists and its value is a numeric type (int or float)."""
+    val = _require(d, key, section)
+    if not isinstance(val, (int, float)):
+        raise ConfigError(f"[{section}].{key} must be a number, got {val!r}")
+    return val
+
+
 VALID_WAN_MODES = {"failover", "load_balance"}
 VALID_ROLES = {"admin", "operator", "viewer"}
 VALID_EVENTS = {
@@ -193,11 +201,19 @@ def _parse_interfaces(raw: list) -> list[InterfaceConfig]:
             raise ConfigError(f"Duplicate routing_table_id: {table_id}")
         seen_table_ids.add(table_id)
 
+        label = str(_require(item, "label", s))
+        if not label:
+            raise ConfigError(f"{s}.label must be a non-empty string")
+
+        gateway = str(_require(item, "gateway", s))
+        if not gateway:
+            raise ConfigError(f"{s}.gateway must be a non-empty string")
+
         result.append(InterfaceConfig(
             name=name,
-            label=str(_require(item, "label", s)),
+            label=label,
             expected_speed_mbps=int(_require_positive(item, "expected_speed_mbps", s)),
-            gateway=str(_require(item, "gateway", s)),
+            gateway=gateway,
             routing_table_id=table_id,
         ))
 
@@ -225,7 +241,7 @@ def _parse_scoring(raw: dict) -> ScoringConfig:
         loss_penalty_per_percent=_require_non_negative(raw, "loss_penalty_per_percent", s),
         dns_fail_penalty=_require_non_negative(raw, "dns_fail_penalty", s),
         http_fail_penalty=_require_non_negative(raw, "http_fail_penalty", s),
-        hard_fail_threshold=_require(raw, "hard_fail_threshold", s),
+        hard_fail_threshold=_require_number(raw, "hard_fail_threshold", s),
         hysteresis_switch_to_backup=_require_non_negative(raw, "hysteresis_switch_to_backup", s),
         hysteresis_return_to_primary=_require_non_negative(raw, "hysteresis_return_to_primary", s),
         recovery_margin=_require_non_negative(raw, "recovery_margin", s),
@@ -276,7 +292,12 @@ def _parse_alerting(raw: dict) -> AlertingConfig:
 def _parse_server(raw: dict) -> ServerConfig:
     s = "server"
     secret = str(_require(raw, "secret_key", s))
-    if secret in {"CHANGE_THIS_TO_A_RANDOM_STRING", "CHANGE_THIS_TO_A_RANDOM_STRING_MIN_32_CHARS"}:
+    _PLACEHOLDER_KEYS = {
+        "CHANGE_THIS_TO_A_RANDOM_STRING",
+        "CHANGE_THIS_TO_A_RANDOM_STRING_MIN_32_CHARS",
+        "REPLACE_ME_run_python_secrets_token_hex_32",
+    }
+    if secret in _PLACEHOLDER_KEYS:
         raise ConfigError(
             "[server].secret_key is still the default placeholder. "
             "Generate a random string: python -c \"import secrets; print(secrets.token_hex(32))\""

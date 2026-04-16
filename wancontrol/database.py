@@ -646,10 +646,17 @@ class Database:
 
     def get_db_stats(self) -> DbStats:
         """Return row counts and file size for the dashboard."""
+        _TABLES = (
+            "metrics", "switch_events", "controller_events", "alerts", "users"
+        )
         with self._conn() as conn:
-            def count(table: str) -> int:
-                return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-
+            counts = {
+                t: conn.execute(
+                    "SELECT COUNT(*) FROM "
+                    + t  # table names are internal constants, not user input
+                ).fetchone()[0]
+                for t in _TABLES
+            }
             version_row = conn.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()
@@ -659,11 +666,11 @@ class Database:
 
         return DbStats(
             file_size_bytes=file_size,
-            metrics_count=count("metrics"),
-            switch_events_count=count("switch_events"),
-            controller_events_count=count("controller_events"),
-            alerts_count=count("alerts"),
-            users_count=count("users"),
+            metrics_count=counts["metrics"],
+            switch_events_count=counts["switch_events"],
+            controller_events_count=counts["controller_events"],
+            alerts_count=counts["alerts"],
+            users_count=counts["users"],
             schema_version=version,
         )
 

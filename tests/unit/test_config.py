@@ -235,10 +235,15 @@ class TestValidationErrors:
     # Server / secret_key ---------------------------------------------------------
 
     def test_secret_key_is_placeholder_string(self, tmp_path: Path) -> None:
-        data = _minimal_dict()
-        data["server"]["secret_key"] = "CHANGE_THIS_TO_A_RANDOM_STRING_MIN_32_CHARS"
-        with pytest.raises(ConfigError, match="secret_key"):
-            Config(_write(tmp_path, data)).load()
+        """Both the spec-prescribed placeholder and legacy placeholder are rejected."""
+        for placeholder in (
+            "REPLACE_ME_run_python_secrets_token_hex_32",
+            "CHANGE_THIS_TO_A_RANDOM_STRING_MIN_32_CHARS",
+        ):
+            data = _minimal_dict()
+            data["server"]["secret_key"] = placeholder
+            with pytest.raises(ConfigError, match="secret_key"):
+                Config(_write(tmp_path, data)).load()
 
     def test_secret_key_shorter_than_32(self, tmp_path: Path) -> None:
         data = _minimal_dict()
