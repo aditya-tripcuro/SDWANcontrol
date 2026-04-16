@@ -323,6 +323,7 @@ class Database:
                 f"FROM metrics {where} ORDER BY timestamp DESC LIMIT ?",
                 params,
             ).fetchall()
+        return [_metric_from_row(r) for r in rows]
 
     def get_latest_metric(self, interface: str) -> MetricRow | None:
         """Return the most recent metric for one interface."""
@@ -464,6 +465,7 @@ class Database:
                 "last_login, is_active FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
+        return _user_from_row(row) if row else None
 
     def get_user_by_id(self, user_id: int) -> UserRow | None:
         with self._conn() as conn:
@@ -472,6 +474,7 @@ class Database:
                 "last_login, is_active FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
+        return _user_from_row(row) if row else None
 
     def list_users(self) -> list[UserRow]:
         with self._conn() as conn:
@@ -479,6 +482,7 @@ class Database:
                 "SELECT id, username, password_hash, role, created_at, "
                 "last_login, is_active FROM users ORDER BY created_at"
             ).fetchall()
+        return [_user_from_row(r) for r in rows]
 
     def update_user_password(self, user_id: int, password_hash: str) -> None:
         with self._write_lock, self._conn() as conn:
@@ -537,6 +541,7 @@ class Database:
                 "FROM api_tokens WHERE token_hash = ?",
                 (token_hash,),
             ).fetchone()
+        return _token_from_row(row) if row else None
 
     def touch_api_token(self, token_id: int) -> None:
         with self._write_lock, self._conn() as conn:
@@ -565,6 +570,7 @@ class Database:
                 f"FROM api_tokens {where} ORDER BY created_at DESC",
                 params,
             ).fetchall()
+        return [_token_from_row(r) for r in rows]
 
     # ── Alerts ─────────────────────────────────────────────────────────────
 
@@ -602,6 +608,7 @@ class Database:
                 "SELECT id, timestamp, level, title, body, resolved_at, notified "
                 "FROM alerts WHERE notified = 0 ORDER BY timestamp"
             ).fetchall()
+        return [_alert_from_row(r) for r in rows]
 
     def get_recent_alerts(self, limit: int = 20) -> list[AlertRow]:
         with self._conn() as conn:
@@ -610,6 +617,7 @@ class Database:
                 "FROM alerts ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             ).fetchall()
+        return [_alert_from_row(r) for r in rows]
 
     # ── Retention / pruning ────────────────────────────────────────────────
 

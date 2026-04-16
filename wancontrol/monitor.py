@@ -8,8 +8,6 @@ It does not run its own thread or loop — it is called, does work, returns.
 Threading is used internally for parallelism within a single call.
 """
 
-from __future__ import annotations
-
 import logging
 import time
 import traceback
@@ -17,10 +15,10 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from wancontrol.config import InterfaceConfig, ProbeConfig, ScoringConfig
 from wancontrol.network import probe_icmp, probe_dns, probe_http, get_interface_ip
 
 if TYPE_CHECKING:
-    from wancontrol.config import InterfaceConfig, ProbeConfig, ScoringConfig
     from wancontrol.database import Database
 
 
@@ -85,7 +83,7 @@ class Monitor:
         self,
         probe_cfg: ProbeConfig,
         scoring_cfg: ScoringConfig,
-        db: Database,
+        db: "Database",
     ) -> None:
         """
         Initialize the Monitor.
