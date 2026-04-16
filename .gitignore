@@ -1,0 +1,60 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Test and coverage artifacts ───────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ── Secrets and environment files ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── WANControl runtime files ──────────────────────────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+*.lock
+*.heartbeat
+logs/
+
+# ── OS artifacts ──────────────────────────────────────────────────────────────
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# ── Editor artifacts ──────────────────────────────────────────────────────────
+# VS Code — keep extensions.json and settings.json if the team commits them
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# JetBrains
+.idea/
+
+# Vim
+*.swp
+*.swo
+*~
