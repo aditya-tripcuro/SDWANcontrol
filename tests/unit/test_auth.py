@@ -194,31 +194,51 @@ class TestAuthenticate:
         after = auth._db.get_user_by_id(uid)
         assert after is not None and after.last_login is not None
 
-    def test_timing_safety_unknown_vs_wrong_password(self, auth: Auth) -> None:
-        """Both paths run bcrypt — their wall-clock times should be within 2x."""
-        _make_user(auth, username="timing_user", password="validpassword1234")
+    def test_timing_safety_unknown_vs_wrong_password(self, auth, monkeypatch):
+        """
+        Verify that authenticate() always runs bcrypt regardless of whether
+        the username exists. Tests the code path, not wall-clock timing.
 
-        # Warm up the dummy hash cache so the first unknown-user check
-        # doesn't include the one-time cost of generating _dummy_hash.
-        try:
-            auth.authenticate("warmup_xyz_abc", "ignored")
-        except AuthError:
-            pass
+        Wall-clock timing tests are inherently flaky due to OS scheduling,
+        CPU cache state, and bcrypt variance. Instead we verify that
+        bcrypt.checkpw() is called in both the known-user/wrong-password
+        and unknown-user code paths.
+        """
+        import bcrypt
 
-        t0 = time.perf_counter()
-        with pytest.raises(AuthError):
-            auth.authenticate("timing_user", "definitely_wrong_pass!!")
-        wrong_pw_time = time.perf_counter() - t0
+        monkeypatch.setattr("wancontrol.auth.BCRYPT_ROUNDS", 4)
 
-        t0 = time.perf_counter()
-        with pytest.raises(AuthError):
-            auth.authenticate("totally_unknown_user_xyz", "definitely_wrong_pass!!")
-        unknown_time = time.perf_counter() - t0
+        # Create a known user
+        auth.create_user("timing_user", "StrongPassword123!", "viewer")
 
-        ratio = max(wrong_pw_time, unknown_time) / min(wrong_pw_time, unknown_time)
-        assert ratio < 2.0, (
-            f"Timing ratio {ratio:.2f}x exceeds 2x "
-            f"(known={wrong_pw_time:.4f}s, unknown={unknown_time:.4f}s)"
+        checkpw_calls = []
+
+        original_checkpw = bcrypt.checkpw
+
+        def tracking_checkpw(password: bytes, hashed: bytes) -> bool:
+            checkpw_calls.append({"password_len": len(password)})
+            return original_checkpw(password, hashed)
+
+        monkeypatch.setattr("wancontrol.auth.bcrypt.checkpw", tracking_checkpw)
+
+        # Known user, wrong password — bcrypt.checkpw must be called
+        checkpw_calls.clear()
+        with pytest.raises(AuthError) as exc_info:
+            auth.authenticate("timing_user", "WrongPassword999!")
+        assert exc_info.value.code == "invalid_credentials"
+        assert len(checkpw_calls) == 1, (
+            "bcrypt.checkpw must be called exactly once for known user / wrong password"
+        )
+
+        # Unknown user — bcrypt.checkpw must ALSO be called (dummy hash path)
+        checkpw_calls.clear()
+        with pytest.raises(AuthError) as exc_info:
+            auth.authenticate("no_such_user", "AnyPassword123!")
+        assert exc_info.value.code == "invalid_credentials"
+        assert len(checkpw_calls) == 1, (
+            "bcrypt.checkpw must be called exactly once for unknown username "
+            "(timing attack prevention). If this fails, auth.py is leaking "
+            "username existence via response time."
         )
 
 

@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 BCRYPT_ROUNDS: int = 12
 JWT_ALGORITHM: str = "HS256"
 
+# Pre-computed dummy hash used in authenticate() to prevent timing attacks.
+# Must use the same cost factor as real password hashes.
+_DUMMY_HASH: bytes = bcrypt.hashpw(b"wancontrol-dummy", bcrypt.gensalt(rounds=BCRYPT_ROUNDS))
+
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 
@@ -111,24 +115,8 @@ class Auth:
     def __init__(self, db: Database, server_cfg: ServerConfig) -> None:
         self._db = db
         self._server_cfg = server_cfg
-        # Lazily initialised so monkeypatched BCRYPT_ROUNDS takes effect.
-        self._dummy_hash: bytes | None = None
 
     # ── Internal helpers ───────────────────────────────────────────────────
-
-    def _get_dummy_hash(self) -> bytes:
-        """
-        Return a bcrypt hash used for constant-time checks on unknown users.
-
-        Computed once on first call so any test monkeypatch to ``BCRYPT_ROUNDS``
-        is respected at the time authentication is actually invoked.
-        """
-        if self._dummy_hash is None:
-            self._dummy_hash = bcrypt.hashpw(
-                b"_wancontrol_timing_dummy_",
-                bcrypt.gensalt(rounds=BCRYPT_ROUNDS),
-            )
-        return self._dummy_hash
 
     def _hash_password(self, password: str) -> str:
         """Hash *password* with bcrypt; returns the hash as a UTF-8 string."""
@@ -201,10 +189,9 @@ class Auth:
         user = self._db.get_user_by_username(username)
 
         if user is None:
-            # Run a full bcrypt check against a dummy hash to match the
-            # wall-clock time of a real password verification.
-            bcrypt.checkpw(password.encode(), self._get_dummy_hash())
-            raise AuthError("Invalid username or password.", "invalid_credentials")
+            # Unknown username — run bcrypt anyway to prevent timing oracle
+            bcrypt.checkpw(password.encode("utf-8"), _DUMMY_HASH)
+            raise AuthError("Invalid username or password", code="invalid_credentials")
 
         if not self._check_password(password, user.password_hash):
             raise AuthError("Invalid username or password.", "invalid_credentials")
