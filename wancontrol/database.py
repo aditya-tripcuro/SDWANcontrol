@@ -290,7 +290,14 @@ class Database:
                 f"FROM metrics {where} ORDER BY timestamp DESC LIMIT ?",
                 params,
             ).fetchall()
-        return [MetricRow(*r) for r in rows]
+        return [
+            MetricRow(
+                id=r[0], interface=r[1], timestamp=r[2],
+                latency_ms=r[3], jitter_ms=r[4], loss_pct=r[5],
+                dns_ok=bool(r[6]), http_ok=bool(r[7]), score=r[8],
+            )
+            for r in rows
+        ]
 
     def get_latest_metric(self, interface: str) -> MetricRow | None:
         """Return the most recent metric for one interface."""
@@ -301,7 +308,13 @@ class Database:
                 "FROM metrics WHERE interface = ? ORDER BY timestamp DESC LIMIT 1",
                 (interface,),
             ).fetchone()
-        return MetricRow(*row) if row else None
+        if row is None:
+            return None
+        return MetricRow(
+            id=row[0], interface=row[1], timestamp=row[2],
+            latency_ms=row[3], jitter_ms=row[4], loss_pct=row[5],
+            dns_ok=bool(row[6]), http_ok=bool(row[7]), score=row[8],
+        )
 
     # ── Switch events ──────────────────────────────────────────────────────
 
@@ -432,7 +445,13 @@ class Database:
                 "last_login, is_active FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
-        return UserRow(*row) if row else None
+        if row is None:
+            return None
+        return UserRow(
+            id=row[0], username=row[1], password_hash=row[2],
+            role=row[3], created_at=row[4], last_login=row[5],
+            is_active=bool(row[6]),
+        )
 
     def get_user_by_id(self, user_id: int) -> UserRow | None:
         with self._conn() as conn:
@@ -441,7 +460,13 @@ class Database:
                 "last_login, is_active FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
-        return UserRow(*row) if row else None
+        if row is None:
+            return None
+        return UserRow(
+            id=row[0], username=row[1], password_hash=row[2],
+            role=row[3], created_at=row[4], last_login=row[5],
+            is_active=bool(row[6]),
+        )
 
     def list_users(self) -> list[UserRow]:
         with self._conn() as conn:
@@ -449,7 +474,14 @@ class Database:
                 "SELECT id, username, password_hash, role, created_at, "
                 "last_login, is_active FROM users ORDER BY created_at"
             ).fetchall()
-        return [UserRow(*r) for r in rows]
+        return [
+            UserRow(
+                id=r[0], username=r[1], password_hash=r[2],
+                role=r[3], created_at=r[4], last_login=r[5],
+                is_active=bool(r[6]),
+            )
+            for r in rows
+        ]
 
     def update_user_password(self, user_id: int, password_hash: str) -> None:
         with self._write_lock, self._conn() as conn:
@@ -508,7 +540,13 @@ class Database:
                 "FROM api_tokens WHERE token_hash = ?",
                 (token_hash,),
             ).fetchone()
-        return ApiTokenRow(*row) if row else None
+        if row is None:
+            return None
+        return ApiTokenRow(
+            id=row[0], user_id=row[1], token_hash=row[2],
+            label=row[3], created_at=row[4], last_used=row[5],
+            expires_at=row[6], is_revoked=bool(row[7]),
+        )
 
     def touch_api_token(self, token_id: int) -> None:
         with self._write_lock, self._conn() as conn:
@@ -537,7 +575,14 @@ class Database:
                 f"FROM api_tokens {where} ORDER BY created_at DESC",
                 params,
             ).fetchall()
-        return [ApiTokenRow(*r) for r in rows]
+        return [
+            ApiTokenRow(
+                id=r[0], user_id=r[1], token_hash=r[2],
+                label=r[3], created_at=r[4], last_used=r[5],
+                expires_at=r[6], is_revoked=bool(r[7]),
+            )
+            for r in rows
+        ]
 
     # ── Alerts ─────────────────────────────────────────────────────────────
 
@@ -575,7 +620,14 @@ class Database:
                 "SELECT id, timestamp, level, title, body, resolved_at, notified "
                 "FROM alerts WHERE notified = 0 ORDER BY timestamp"
             ).fetchall()
-        return [AlertRow(*r) for r in rows]
+        return [
+            AlertRow(
+                id=r[0], timestamp=r[1], level=r[2],
+                title=r[3], body=r[4], resolved_at=r[5],
+                notified=bool(r[6]),
+            )
+            for r in rows
+        ]
 
     def get_recent_alerts(self, limit: int = 20) -> list[AlertRow]:
         with self._conn() as conn:
@@ -584,7 +636,14 @@ class Database:
                 "FROM alerts ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [AlertRow(*r) for r in rows]
+        return [
+            AlertRow(
+                id=r[0], timestamp=r[1], level=r[2],
+                title=r[3], body=r[4], resolved_at=r[5],
+                notified=bool(r[6]),
+            )
+            for r in rows
+        ]
 
     # ── Retention / pruning ────────────────────────────────────────────────
 
@@ -672,6 +731,29 @@ class Database:
             alerts_count=counts["alerts"],
             users_count=counts["users"],
             schema_version=version,
+        )
+
+    def close(self) -> None:
+        """
+        Close the thread-local SQLite connection for the calling thread.
+
+        Call this from each thread before it exits, and from the main thread
+        on SIGTERM/SIGINT to ensure clean shutdown. Safe to call multiple times.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error as exc:
+                logger.warning(
+                    "Error closing DB connection: %s", exc,
+                    extra={"component": "database"},
+                )
+            finally:
+                self._local.conn = None
+        logger.debug(
+            "Database connection closed for thread",
+            extra={"component": "database"},
         )
 
     # ── Migrations ─────────────────────────────────────────────────────────

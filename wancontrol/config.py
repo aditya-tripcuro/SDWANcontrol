@@ -19,7 +19,7 @@ import signal
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -196,7 +196,7 @@ def _parse_interfaces(raw: list) -> list[InterfaceConfig]:
 
         table_id = _require(item, "routing_table_id", s)
         if not isinstance(table_id, int) or table_id < 1 or table_id > 252:
-            raise ConfigError(f"{s}.routing_table_id must be int 1-252, got {table_id!r}")
+            raise ConfigError(f"{s}.routing_table_id must be an integer between 1 and 252 (inclusive), got {table_id!r}")
         if table_id in seen_table_ids:
             raise ConfigError(f"Duplicate routing_table_id: {table_id}")
         seen_table_ids.add(table_id)
@@ -358,7 +358,7 @@ class Config:
         self._path = Path(path)
         self._lock = threading.RLock()
         self._current: AppConfig | None = None
-        self._reload_callbacks: list[callable] = []
+        self._reload_callbacks: list[Callable[[AppConfig], None]] = []
 
     # ── Public interface ───────────────────────────────────────────────────
 
@@ -411,7 +411,7 @@ class Config:
 
         signal.signal(signal.SIGHUP, _handler)
 
-    def on_reload(self, callback: callable) -> None:
+    def on_reload(self, callback: Callable[[AppConfig], None]) -> None:
         """Register a callback(new_config: AppConfig) called after successful reload."""
         self._reload_callbacks.append(callback)
 
