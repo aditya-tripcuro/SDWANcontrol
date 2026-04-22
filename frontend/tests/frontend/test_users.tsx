@@ -6,5 +6,5 @@ import { AuthProvider } from '../../src/auth/AuthContext'
 
 test('renders users page', () => {
   render(<MemoryRouter><AuthProvider><UsersPage /></AuthProvider></MemoryRouter>)
-  expect(screen.getByText(/Users/i)).toBeInTheDocument()
+  expect(screen.getByRole('heading', { name: /Users/i })).toBeInTheDocument()
 })

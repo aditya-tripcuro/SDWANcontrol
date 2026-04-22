@@ -18,10 +18,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Force dry-run OFF for all tests so real code paths execute.
-os.environ["WANCONTROL_DRY_RUN"] = "0"
-
 import wancontrol.network as net
+# Force dry-run OFF for all tests so real code paths execute.
+net.DRY_RUN = False
+
 from wancontrol.network import (
     _run,
     add_policy_route_table,

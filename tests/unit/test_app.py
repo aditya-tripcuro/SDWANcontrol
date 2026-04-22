@@ -1,3 +1,4 @@
+from __future__ import annotations
 import time
 import pytest
 import jwt as pyjwt
@@ -416,16 +417,7 @@ def test_protected_endpoints_set_cache_control_no_store(seeded_client):
     r = seeded_client.get("/api/status", headers={"Authorization": "Bearer bad"})
     assert r.status_code == 401
     assert r.headers.get("Cache-Control") == "no-store"
-"""
-tests/unit/test_app.py
-~~~~~~~~~~~~~~~~~~~~~~
-Full pytest suite for wancontrol/app.py (Phase 6).
 
-Uses a real in-memory Database, a real Auth instance, and lightweight stubs
-for Controller and Config so no networking or file I/O occurs.
-"""
-
-from __future__ import annotations
 
 import time
 from typing import Any

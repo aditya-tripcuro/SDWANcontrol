@@ -10,5 +10,3 @@ test('renders username and password input fields and sign in button', () => {
   expect(screen.getByLabelText(/Password/i)).toBeInTheDocument()
   expect(screen.getByText(/Sign in/i)).toBeInTheDocument()
 })
-
-*** End Patch

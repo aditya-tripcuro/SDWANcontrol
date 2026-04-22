@@ -1,4 +1,4 @@
-import { rest } from 'msw'
+import { http, HttpResponse } from 'msw'
 
 const ADMIN_PAYLOAD = { sub: 1, username: 'admin', role: 'admin', iat: 1700000000, exp: 1700000000 + 3600 }
 export const FAKE_ADMIN_JWT = `eyJhbGciOiJIUzI1NiJ9.${btoa(JSON.stringify(ADMIN_PAYLOAD))}.fakesig`
@@ -37,24 +37,24 @@ export const FAKE_USERS = [
 ]
 
 export const handlers = [
-  rest.post('/api/auth/login', (req, res, ctx) => {
-    return res(ctx.status(200), ctx.json({ access_token: FAKE_ADMIN_JWT, token_type: 'bearer', expires_in: 3600 }))
+  http.post('/api/auth/login', () => {
+    return HttpResponse.json({ access_token: FAKE_ADMIN_JWT, token_type: 'bearer', expires_in: 3600 })
   }),
 
-  rest.get('/api/status', (req, res, ctx) => res(ctx.json(FAKE_STATUS))),
-  rest.get('/api/status/interfaces', (req, res, ctx) => res(ctx.json(FAKE_INTERFACES))),
-  rest.get('/api/metrics', (req, res, ctx) => res(ctx.json(FAKE_METRICS))),
-  rest.get('/api/metrics/latest', (req, res, ctx) => res(ctx.json(FAKE_METRICS_LATEST))),
-  rest.get('/api/events/switches', (req, res, ctx) => res(ctx.json([]))),
-  rest.get('/api/events/controller', (req, res, ctx) => res(ctx.json([]))),
-  rest.get('/api/alerts', (req, res, ctx) => res(ctx.json(FAKE_ALERTS))),
-  rest.post('/api/alerts/:id/resolve', (req, res, ctx) => res(ctx.status(200), ctx.json({ resolved: true }))),
-  rest.get('/api/users', (req, res, ctx) => res(ctx.json(FAKE_USERS))),
-  rest.post('/api/users', (req, res, ctx) => res(ctx.status(201), ctx.json({ id: 2, username: 'new', role: 'viewer' }))),
-  rest.get('/api/tokens', (req, res, ctx) => res(ctx.json([]))),
-  rest.post('/api/tokens', (req, res, ctx) => res(ctx.status(201), ctx.json({ token: 'rawtoken123', label: 'lbl' }))),
-  rest.delete('/api/tokens/:id', (req, res, ctx) => res(ctx.status(200), ctx.json({ revoked: true }))),
-  rest.get('/api/config/raw', (req, res, ctx) => res(ctx.text('interfaces: []\n'))),
-  rest.put('/api/config/interfaces', (req, res, ctx) => res(ctx.json({ updated: true, interfaces: 2 }))),
-  rest.post('/api/config/reload', (req, res, ctx) => res(ctx.json({ reloaded: true }))),
+  http.get('/api/status', () => HttpResponse.json(FAKE_STATUS)),
+  http.get('/api/status/interfaces', () => HttpResponse.json(FAKE_INTERFACES)),
+  http.get('/api/metrics', () => HttpResponse.json(FAKE_METRICS)),
+  http.get('/api/metrics/latest', () => HttpResponse.json(FAKE_METRICS_LATEST)),
+  http.get('/api/events/switches', () => HttpResponse.json([])),
+  http.get('/api/events/controller', () => HttpResponse.json([])),
+  http.get('/api/alerts', () => HttpResponse.json(FAKE_ALERTS)),
+  http.post('/api/alerts/:id/resolve', () => HttpResponse.json({ resolved: true })),
+  http.get('/api/users', () => HttpResponse.json(FAKE_USERS)),
+  http.post('/api/users', () => HttpResponse.json({ id: 2, username: 'new', role: 'viewer' }, { status: 201 })),
+  http.get('/api/tokens', () => HttpResponse.json([])),
+  http.post('/api/tokens', () => HttpResponse.json({ token: 'rawtoken123', label: 'lbl' }, { status: 201 })),
+  http.delete('/api/tokens/:id', () => HttpResponse.json({ revoked: true })),
+  http.get('/api/config/raw', () => new HttpResponse('interfaces: []\n')),
+  http.put('/api/config/interfaces', () => HttpResponse.json({ updated: true, interfaces: 2 })),
+  http.post('/api/config/reload', () => HttpResponse.json({ reloaded: true })),
 ]
