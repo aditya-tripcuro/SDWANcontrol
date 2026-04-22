@@ -16,6 +16,9 @@ import time
 import traceback
 from functools import wraps
 from typing import TYPE_CHECKING, Any
+import json as _json
+from pathlib import Path
+import yaml
 
 from flask import (
     Blueprint,
@@ -25,11 +28,13 @@ from flask import (
     g,
     jsonify,
     request,
+    stream_with_context,
+    send_from_directory,
 )
 
 from wancontrol import __version__
 from wancontrol.auth import Auth, AuthError, UserPrincipal
-from wancontrol.config import AppConfig, Config
+from wancontrol.config import AppConfig, Config, ConfigError, _parse_interfaces
 from wancontrol.database import ApiTokenRow, Database, MetricRow, UserRow
 
 if TYPE_CHECKING:
@@ -80,6 +85,18 @@ def _metric_to_dict(m: MetricRow) -> dict[str, Any]:
         "dns_ok": bool(m.dns_ok),
         "http_ok": bool(m.http_ok),
         "score": m.score,
+    }
+
+
+def _alert_to_dict(a) -> dict[str, Any]:
+    return {
+        "id": a.id,
+        "timestamp": a.timestamp,
+        "level": a.level,
+        "title": a.title,
+        "body": a.body,
+        "resolved_at": a.resolved_at,
+        "notified": bool(a.notified),
     }
 
 
@@ -571,6 +588,96 @@ def db_flush() -> tuple[Response, int]:
     return jsonify({"flushed": True}), 200
 
 
+# ── SSE stream / config edit endpoints (Phase 7) ---------------------------
+
+
+@api_bp.route("/stream", methods=["GET"])
+def sse_stream():
+    # EventSource cannot set headers — accept token from query param
+    token = request.args.get("token", "")
+    auth: Auth = current_app.config["AUTH"]
+    try:
+        principal = auth.verify_token(token)
+    except AuthError as e:
+        return jsonify({"error": e.code, "message": e.message}), 401
+
+    controller: Controller = current_app.config["CONTROLLER"]
+    cfg: AppConfig = current_app.config["CFG"]
+    db: Database = current_app.config["DB"]
+
+    def event_stream():
+        last_alert_id = 0
+        while True:
+            # Push status
+            status = controller.get_status()
+            yield f"event: status\ndata: {_json.dumps(status)}\n\n"
+
+            # Push latest metrics
+            latest = {
+                iface.name: _metric_to_dict(db.get_latest_metric(iface.name))
+                for iface in cfg.interfaces
+            }
+            yield f"event: metric\ndata: {_json.dumps(latest)}\n\n"
+
+            # Push any new unnotified alerts
+            for alert in db.get_unnotified_alerts():
+                if alert.id > last_alert_id:
+                    last_alert_id = alert.id
+                    yield f"event: alert\ndata: {_json.dumps(_alert_to_dict(alert))}\n\n"
+
+            time.sleep(5)
+
+    return Response(
+        stream_with_context(event_stream()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@api_bp.route("/config/raw", methods=["GET"])
+@require_role("operator")
+def get_config_raw():
+    cfg_loader: Config = current_app.config["CFG_LOADER"]
+    path: Path = cfg_loader._path
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            content = fh.read()
+    except FileNotFoundError:
+        return jsonify({"error": "not_found", "message": "config.yaml not found"}), 404
+    return Response(content, mimetype="text/plain; charset=utf-8"), 200
+
+
+@api_bp.route("/config/interfaces", methods=["PUT"])
+@require_role("operator")
+def put_config_interfaces():
+    body = request.get_json(force=True, silent=True)
+    if not body or "interfaces" not in body:
+        return jsonify({"error": "bad_request", "message": "interfaces required"}), 400
+
+    new_raw = body["interfaces"]
+    try:
+        # Validate via existing parser
+        _parse_interfaces(new_raw)
+    except ConfigError as err:
+        return jsonify({"error": "ConfigError", "message": str(err)}), 400
+
+    cfg_loader: Config = current_app.config["CFG_LOADER"]
+    cfg_path: Path = cfg_loader._path
+    try:
+        with cfg_path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        return jsonify({"error": "not_found", "message": "config.yaml not found"}), 404
+
+    data["interfaces"] = new_raw
+
+    with cfg_path.open("w", encoding="utf-8") as fh:
+        yaml.dump(data, fh, allow_unicode=True, default_flow_style=False)
+
+    cfg_loader.reload()
+    return jsonify({"updated": True, "interfaces": len(new_raw)}), 200
+
+
 # ── Application factory ────────────────────────────────────────────────────────
 
 def create_app(
@@ -602,6 +709,18 @@ def create_app(
     app.config["CONTROLLER"] = controller
 
     app.register_blueprint(api_bp)
+
+    # Serve frontend dist (SPA) if present
+    FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+
+    @app.route("/assets/<path:filename>")
+    def static_assets(filename: str):
+        return send_from_directory(FRONTEND_DIST / "assets", filename)
+
+    @app.route("/", defaults={"path": ""})
+    @app.route("/<path:path>")
+    def spa_catchall(path: str):
+        return send_from_directory(FRONTEND_DIST, "index.html")
 
     # ── Error handlers ─────────────────────────────────────────────────────
 
