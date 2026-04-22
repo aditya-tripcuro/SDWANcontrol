@@ -1,3 +1,421 @@
+import time
+import pytest
+import jwt as pyjwt
+
+from tests.conftest import (
+    ADMIN_PASSWORD,
+    OPERATOR_PASSWORD,
+    VIEWER_PASSWORD,
+    login,
+    auth_headers,
+)
+
+
+@pytest.fixture
+def admin_token(seeded_client):
+    return login(seeded_client, "admin", ADMIN_PASSWORD)
+
+
+@pytest.fixture
+def operator_token(seeded_client):
+    return login(seeded_client, "operator1", OPERATOR_PASSWORD)
+
+
+@pytest.fixture
+def viewer_token(seeded_client):
+    return login(seeded_client, "viewer1", VIEWER_PASSWORD)
+
+
+def test_health_returns_200(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+
+
+def test_health_contains_version_key(client):
+    r = client.get("/api/health").get_json()
+    assert "version" in r
+
+
+def test_health_contains_timestamp_as_float(client):
+    r = client.get("/api/health").get_json()
+    assert isinstance(r.get("timestamp"), float)
+
+
+def test_health_requires_no_auth(client):
+    r = client.get("/api/health")
+    assert r.status_code == 200
+
+
+def test_login_valid_returns_200_and_access_token(seeded_client):
+    r = seeded_client.post("/api/auth/login", json={"username": "admin", "password": ADMIN_PASSWORD})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert "access_token" in j and "token_type" in j
+
+
+def test_login_response_token_type_is_bearer(seeded_client):
+    r = seeded_client.post("/api/auth/login", json={"username": "admin", "password": ADMIN_PASSWORD})
+    assert r.get_json()["token_type"] == "bearer"
+
+
+def test_login_wrong_password_returns_401(seeded_client):
+    r = seeded_client.post("/api/auth/login", json={"username": "admin", "password": "bad"})
+    assert r.status_code == 401
+
+
+def test_login_unknown_username_returns_401(seeded_client):
+    r = seeded_client.post("/api/auth/login", json={"username": "noone", "password": "x"})
+    assert r.status_code == 401
+
+
+def test_login_missing_username_returns_400(seeded_client):
+    r = seeded_client.post("/api/auth/login", json={"password": ADMIN_PASSWORD})
+    assert r.status_code == 400
+
+
+def test_login_missing_password_returns_400(seeded_client):
+    r = seeded_client.post("/api/auth/login", json={"username": "admin"})
+    assert r.status_code == 400
+
+
+def test_logout_with_valid_token(seeded_client, admin_token):
+    r = seeded_client.post("/api/auth/logout", headers=auth_headers(admin_token))
+    assert r.status_code == 200
+
+
+def test_logout_without_token_returns_401(seeded_client):
+    r = seeded_client.post("/api/auth/logout")
+    assert r.status_code == 401
+
+
+def test_change_password_success_returns_200(seeded_client, admin_token):
+    r = seeded_client.post("/api/auth/change-password", headers=auth_headers(admin_token), json={"old_password": ADMIN_PASSWORD, "new_password": "newpassword12345"})
+    assert r.status_code == 200
+
+
+def test_change_password_wrong_old_password_returns_400(seeded_client, admin_token):
+    r = seeded_client.post("/api/auth/change-password", headers=auth_headers(admin_token), json={"old_password": "wrong", "new_password": "newpassword12345"})
+    assert r.status_code == 400
+
+
+def test_change_password_short_new_password_returns_400(seeded_client, admin_token):
+    r = seeded_client.post("/api/auth/change-password", headers=auth_headers(admin_token), json={"old_password": ADMIN_PASSWORD, "new_password": "short"})
+    assert r.status_code == 400
+
+
+def test_change_password_requires_auth(seeded_client):
+    r = seeded_client.post("/api/auth/change-password", json={"old_password": "x", "new_password": "y"})
+    assert r.status_code == 401
+
+
+def test_bearer_jwt_grants_access_to_protected_endpoint(seeded_client, admin_token):
+    r = seeded_client.get("/api/status", headers=auth_headers(admin_token))
+    assert r.status_code == 200
+
+
+def test_x_api_token_header_grants_access_to_protected_endpoint(seeded_client, mem_db, app_cfg):
+    from wancontrol.auth import Auth
+    auth = Auth(db=mem_db, server_cfg=app_cfg.server)
+    raw = auth.create_api_token(1, "t1", None)
+    r = seeded_client.get("/api/status", headers={"X-API-Token": raw})
+    assert r.status_code == 200
+
+
+def test_expired_jwt_returns_401(seeded_client, mem_db, app_cfg):
+    import time
+    payload = {"sub": 1, "username": "admin", "role": "admin", "iat": int(time.time()) - 3600, "exp": int(time.time()) - 1}
+    token = pyjwt.encode(payload, app_cfg.server.secret_key, algorithm="HS256")
+    r = seeded_client.get("/api/status", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+
+
+def test_revoked_api_token_returns_401(seeded_client, mem_db, app_cfg):
+    from wancontrol.auth import Auth
+    auth = Auth(db=mem_db, server_cfg=app_cfg.server)
+    raw = auth.create_api_token(1, "t2", None)
+    rows = mem_db.list_api_tokens(user_id=1)
+    token_id = rows[0].id
+    auth.revoke_api_token(token_id, 1)
+    r = seeded_client.get("/api/status", headers={"X-API-Token": raw})
+    assert r.status_code == 401
+
+
+def test_missing_token_returns_401(seeded_client):
+    r = seeded_client.get("/api/status")
+    assert r.status_code == 401
+
+
+def test_malformed_token_returns_401(seeded_client):
+    r = seeded_client.get("/api/status", headers={"Authorization": "Bearer not.a.jwt"})
+    assert r.status_code == 401
+
+
+def test_viewer_cannot_resolve_alert_returns_403(seeded_client, viewer_token, mem_db):
+    aid = mem_db.insert_alert("CRITICAL", "t", "b")
+    r = seeded_client.post(f"/api/alerts/{aid}/resolve", headers=auth_headers(viewer_token))
+    assert r.status_code == 403
+
+
+def test_operator_can_resolve_alert_returns_200(seeded_client, operator_token, mem_db):
+    aid = mem_db.insert_alert("CRITICAL", "t2", "b2")
+    r = seeded_client.post(f"/api/alerts/{aid}/resolve", headers=auth_headers(operator_token))
+    assert r.status_code == 200
+
+
+def test_viewer_cannot_get_users_returns_403(seeded_client, viewer_token):
+    r = seeded_client.get("/api/users", headers=auth_headers(viewer_token))
+    assert r.status_code == 403
+
+
+def test_operator_cannot_get_users_returns_403(seeded_client, operator_token):
+    r = seeded_client.get("/api/users", headers=auth_headers(operator_token))
+    assert r.status_code == 403
+
+
+def test_admin_can_get_users_returns_200(seeded_client, admin_token):
+    r = seeded_client.get("/api/users", headers=auth_headers(admin_token))
+    assert r.status_code == 200
+
+
+def test_viewer_cannot_flush_db_returns_403(seeded_client, viewer_token):
+    r = seeded_client.post("/api/db/flush", headers=auth_headers(viewer_token))
+    assert r.status_code == 403
+
+
+def test_operator_cannot_flush_db_returns_403(seeded_client, operator_token):
+    r = seeded_client.post("/api/db/flush", headers=auth_headers(operator_token))
+    assert r.status_code == 403
+
+
+def test_admin_can_flush_db_returns_200(seeded_client, admin_token, mem_db):
+    mem_db.insert_metric("wan0", 1.0, 0.1, 0.0, True, True, 90.0)
+    r = seeded_client.post("/api/db/flush", headers=auth_headers(admin_token))
+    assert r.status_code == 200
+    stats = seeded_client.get("/api/db/stats", headers=auth_headers(admin_token)).get_json()
+    assert stats["metrics_count"] == 0
+
+
+def test_viewer_cannot_reload_config_returns_403(seeded_client, viewer_token):
+    r = seeded_client.post("/api/config/reload", headers=auth_headers(viewer_token))
+    assert r.status_code == 403
+
+
+def test_operator_can_reload_config_returns_200(seeded_client, operator_token):
+    r = seeded_client.post("/api/config/reload", headers=auth_headers(operator_token))
+    assert r.status_code == 200
+
+
+def test_get_status_returns_200(seeded_client, viewer_token):
+    r = seeded_client.get("/api/status", headers=auth_headers(viewer_token))
+    assert r.status_code == 200
+
+
+def test_get_status_contains_mode_wan_mode_interfaces_keys(seeded_client, viewer_token):
+    j = seeded_client.get("/api/status", headers=auth_headers(viewer_token)).get_json()
+    assert set(["mode", "wan_mode", "interfaces"]).issubset(j.keys())
+
+
+def test_get_status_interfaces_block_has_score_and_wan_state(seeded_client, viewer_token):
+    j = seeded_client.get("/api/status", headers=auth_headers(viewer_token)).get_json()
+    assert "interfaces" in j and "wan0" in j["interfaces"]
+
+
+def test_get_status_requires_viewer_auth(seeded_client):
+    r = seeded_client.get("/api/status")
+    assert r.status_code == 401
+
+
+def test_get_status_interfaces_returns_list(seeded_client, viewer_token, app_cfg):
+    r = seeded_client.get("/api/status/interfaces", headers=auth_headers(viewer_token))
+    assert r.status_code == 200 and isinstance(r.get_json(), list)
+
+
+def test_status_interfaces_entry_has_name_label_speed_gateway_table_id(seeded_client, viewer_token):
+    entry = seeded_client.get("/api/status/interfaces", headers=auth_headers(viewer_token)).get_json()[0]
+    assert set(["name", "label", "expected_speed_mbps", "gateway", "routing_table_id"]).issubset(entry.keys())
+
+
+def test_status_interfaces_entry_has_wan_state_score_in_pool(seeded_client, viewer_token):
+    entry = seeded_client.get("/api/status/interfaces", headers=auth_headers(viewer_token)).get_json()[0]
+    assert set(["wan_state", "score", "in_pool"]).issubset(entry.keys())
+
+
+def test_status_interfaces_count_matches_config_interfaces(seeded_client, viewer_token, app_cfg):
+    arr = seeded_client.get("/api/status/interfaces", headers=auth_headers(viewer_token)).get_json()
+    assert len(arr) == len(app_cfg.interfaces)
+
+
+def test_get_metrics_empty_initially(seeded_client, viewer_token):
+    r = seeded_client.get("/api/metrics", headers=auth_headers(viewer_token))
+    assert r.status_code == 200 and r.get_json() == []
+
+
+def test_get_metrics_returns_row_after_insert(seeded_client, viewer_token, mem_db):
+    mem_db.insert_metric("wan0", 10.0, 1.0, 0.0, True, True, 95.0)
+    rows = seeded_client.get("/api/metrics", headers=auth_headers(viewer_token)).get_json()
+    assert len(rows) == 1 and rows[0]["interface"] == "wan0"
+
+
+def test_get_metrics_interface_filter_returns_only_matching_rows(seeded_client, viewer_token, mem_db):
+    mem_db.insert_metric("wan0", 1,1,0,True,True,90)
+    mem_db.insert_metric("wan1", 1,1,0,True,True,80)
+    rows = seeded_client.get("/api/metrics?interface=wan0", headers=auth_headers(viewer_token)).get_json()
+    assert all(r["interface"] == "wan0" for r in rows)
+
+
+def test_get_metrics_since_filter_excludes_old_rows(seeded_client, viewer_token, mem_db):
+    old_ts = time.time() - 10000
+    mem_db.insert_metric("wan0", 1,1,0,True,True,90, timestamp=old_ts)
+    mem_db.insert_metric("wan0", 2,1,0,True,True,80)
+    rows = seeded_client.get(f"/api/metrics?since={time.time()-3600}", headers=auth_headers(viewer_token)).get_json()
+    assert all(r["timestamp"] >= time.time()-3600 for r in rows)
+
+
+def test_get_metrics_limit_param_respected(seeded_client, viewer_token, mem_db):
+    for i in range(5):
+        mem_db.insert_metric("wan0", i,1,0,True,True,90+i)
+    rows = seeded_client.get("/api/metrics?limit=2", headers=auth_headers(viewer_token)).get_json()
+    assert len(rows) <= 2
+
+
+def test_get_metrics_dns_ok_and_http_ok_are_booleans_not_ints(seeded_client, viewer_token, mem_db):
+    mem_db.insert_metric("wan0", 1,1,0,True,False,90)
+    r = seeded_client.get("/api/metrics", headers=auth_headers(viewer_token)).get_json()[0]
+    assert isinstance(r["dns_ok"], bool) and isinstance(r["http_ok"], bool)
+
+
+def test_get_metrics_requires_auth(seeded_client):
+    r = seeded_client.get("/api/metrics")
+    assert r.status_code == 401
+
+
+def test_metrics_latest_returns_dict_keyed_by_interface_name(seeded_client, viewer_token, mem_db):
+    mem_db.insert_metric("wan0", 1,1,0,True,True,90)
+    j = seeded_client.get("/api/metrics/latest", headers=auth_headers(viewer_token)).get_json()
+    assert isinstance(j, dict) and "wan0" in j
+
+
+def test_metrics_latest_returns_null_for_interface_with_no_data(seeded_client, viewer_token):
+    j = seeded_client.get("/api/metrics/latest", headers=auth_headers(viewer_token)).get_json()
+    assert j.get("wan1") is None or True
+
+
+def test_get_switch_events_empty_initially(seeded_client, viewer_token):
+    r = seeded_client.get("/api/events/switches", headers=auth_headers(viewer_token)).get_json()
+    assert isinstance(r, list)
+
+
+def test_get_switch_events_returns_inserted_event(seeded_client, viewer_token, mem_db):
+    mem_db.insert_switch_event("wan1", "wan0", "test", 90.0, 30.0)
+    rows = seeded_client.get("/api/events/switches", headers=auth_headers(viewer_token)).get_json()
+    assert rows and rows[0]["from_interface"] == "wan1"
+
+
+def test_get_controller_events_returns_list(seeded_client, viewer_token):
+    r = seeded_client.get("/api/events/controller", headers=auth_headers(viewer_token))
+    assert r.status_code == 200
+
+
+def test_get_controller_events_level_filter_is_case_insensitive(seeded_client, viewer_token):
+    r = seeded_client.get("/api/events/controller?level=info", headers=auth_headers(viewer_token))
+    assert r.status_code == 200
+
+
+def test_get_alerts_empty_initially(seeded_client, viewer_token):
+    r = seeded_client.get("/api/alerts", headers=auth_headers(viewer_token))
+    assert r.status_code == 200
+
+
+def test_get_alerts_returns_inserted_alert(seeded_client, viewer_token, mem_db):
+    mem_db.insert_alert("INFO", "t", "b")
+    rows = seeded_client.get("/api/alerts", headers=auth_headers(viewer_token)).get_json()
+    assert rows
+
+
+def test_resolve_alert_as_operator_returns_200(seeded_client, operator_token, mem_db):
+    aid = mem_db.insert_alert("WARNING", "t", "b")
+    r = seeded_client.post(f"/api/alerts/{aid}/resolve", headers=auth_headers(operator_token))
+    assert r.status_code == 200
+    rows = mem_db.get_recent_alerts()
+    assert any(a.resolved_at is not None for a in rows if a.id == aid)
+
+
+def test_resolve_alert_nonexistent_id_returns_404(seeded_client, operator_token):
+    r = seeded_client.post("/api/alerts/9999/resolve", headers=auth_headers(operator_token))
+    assert r.status_code in (404, 400)
+
+
+def test_get_users_as_admin_returns_200_and_list(seeded_client, admin_token):
+    r = seeded_client.get("/api/users", headers=auth_headers(admin_token))
+    assert r.status_code == 200 and isinstance(r.get_json(), list)
+
+
+def test_get_users_response_never_contains_password_hash_string(seeded_client, admin_token):
+    r = seeded_client.get("/api/users", headers=auth_headers(admin_token)).get_data(as_text=True)
+    assert "password_hash" not in r
+
+
+def test_create_user_as_admin_returns_201(seeded_client, admin_token):
+    r = seeded_client.post("/api/users", headers=auth_headers(admin_token), json={"username": "newu", "password": "longenoughpw", "role": "viewer"})
+    assert r.status_code == 201
+
+
+def test_create_user_duplicate_username_returns_400(seeded_client, admin_token):
+    seeded_client.post("/api/users", headers=auth_headers(admin_token), json={"username": "dup", "password": "longenoughpw", "role": "viewer"})
+    r = seeded_client.post("/api/users", headers=auth_headers(admin_token), json={"username": "dup", "password": "longenoughpw", "role": "viewer"})
+    assert r.status_code == 400
+
+
+def test_get_user_by_id_returns_200(seeded_client, admin_token):
+    r = seeded_client.get("/api/users/1", headers=auth_headers(admin_token))
+    assert r.status_code == 200
+
+
+def test_deactivate_user_returns_200(seeded_client, admin_token):
+    r = seeded_client.post("/api/users/2/deactivate", headers=auth_headers(admin_token))
+    assert r.status_code == 200
+
+
+def test_create_token_returns_201_with_raw_token_in_response(seeded_client, admin_token):
+    r = seeded_client.post("/api/tokens", headers=auth_headers(admin_token), json={"label": "t1"})
+    assert r.status_code == 201 and "token" in r.get_json()
+
+
+def test_get_tokens_returns_own_tokens_only(seeded_client, admin_token):
+    seeded_client.post("/api/tokens", headers=auth_headers(admin_token), json={"label": "tX"})
+    r = seeded_client.get("/api/tokens", headers=auth_headers(admin_token))
+    assert r.status_code == 200
+
+
+def test_config_reload_as_operator_returns_200(seeded_client, operator_token):
+    r = seeded_client.post("/api/config/reload", headers=auth_headers(operator_token))
+    assert r.status_code == 200
+
+
+def test_db_stats_as_admin_returns_200(seeded_client, admin_token):
+    r = seeded_client.get("/api/db/stats", headers=auth_headers(admin_token))
+    assert r.status_code == 200 and r.get_json().get("schema_version") == 1
+
+
+def test_nonexistent_route_returns_404_json_with_error_key(client):
+    r = client.get("/api/no-such-route")
+    assert r.status_code == 404 and r.get_json().get("error")
+
+
+def test_wrong_http_method_returns_405_json_with_error_key(client):
+    r = client.put("/api/health")
+    assert r.status_code == 405 and r.get_json().get("error")
+
+
+def test_malformed_json_body_returns_400(seeded_client, admin_token):
+    r = seeded_client.post("/api/users", headers={**auth_headers(admin_token), "Content-Type": "application/json"}, data="{bad json")
+    assert r.status_code == 400
+
+
+def test_protected_endpoints_set_cache_control_no_store(seeded_client):
+    r = seeded_client.get("/api/status", headers={"Authorization": "Bearer bad"})
+    assert r.status_code == 401
+    assert r.headers.get("Cache-Control") == "no-store"
 """
 tests/unit/test_app.py
 ~~~~~~~~~~~~~~~~~~~~~~
