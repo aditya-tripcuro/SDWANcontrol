@@ -1,0 +1,41 @@
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  human:
+    format: "%(asctime)s [%(levelname)-5s] %(component)-12s: %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+  json:
+    (): wancontrol.logging_config.JsonFormatter
+
+filters:
+  inject_component:
+    (): wancontrol.logging_config.ComponentFilter
+
+handlers:
+  stdout:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: human
+    filters: [inject_component]
+    stream: ext://sys.stdout
+
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: human
+    filters: [inject_component]
+    filename: /var/lib/wancontrol/logs/wancontrol.log
+    maxBytes: 10485760
+    backupCount: 5
+    encoding: utf-8
+
+loggers:
+  werkzeug:
+    level: WARNING
+  urllib3:
+    level: WARNING
+
+root:
+  level: INFO
+  handlers: [stdout, file]

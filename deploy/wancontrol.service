@@ -1,0 +1,33 @@
+[Unit]
+Description=WANControl v2 — SD-WAN Load-Balancing Controller
+Documentation=https://github.com/aditya-tripcuro/SDWANcontrol
+After=network-online.target
+Wants=network-online.target
+After=systemd-networkd-wait-online.service
+
+[Service]
+Type=simple
+User=wancontrol
+Group=wancontrol
+EnvironmentFile=-/etc/wancontrol/.env
+Environment=WANCONTROL_CONFIG=/etc/wancontrol/config.yaml
+WorkingDirectory=/opt/wancontrol
+ExecStart=/opt/wancontrol/venv/bin/python -m wancontrol
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
+RuntimeDirectory=wancontrol
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/wancontrol /etc/wancontrol /run/wancontrol
+CapabilityBoundingSet=
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wancontrol
+
+[Install]
+WantedBy=multi-user.target
