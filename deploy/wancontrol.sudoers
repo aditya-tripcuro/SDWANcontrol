@@ -6,6 +6,7 @@ Defaults:wancontrol !requiretty
 
 # iproute2 — route management
 wancontrol ALL=(root) NOPASSWD: /sbin/ip route add default via * dev *
+wancontrol ALL=(root) NOPASSWD: /sbin/ip route add default nexthop *
 wancontrol ALL=(root) NOPASSWD: /sbin/ip route del default
 wancontrol ALL=(root) NOPASSWD: /sbin/ip route add * dev * src * table *
 wancontrol ALL=(root) NOPASSWD: /sbin/ip route add default via * dev * table *

@@ -115,7 +115,7 @@ install_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         cp "$APP_ROOT/config.yaml" "$CONFIG_FILE"
         chown root:wancontrol "$CONFIG_FILE"
-        chmod 0640 "$CONFIG_FILE"
+        chmod 0660 "$CONFIG_FILE"
     fi
 
     if [[ ! -f "$LOGGING_FILE" ]]; then
