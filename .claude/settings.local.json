@@ -4,7 +4,10 @@
       "Bash(python -m pytest tests/unit/test_config.py tests/unit/test_database.py -v --tb=short)",
       "Bash(python -m pytest tests/unit/test_config.py tests/unit/test_database.py -v --tb=short --cov=wancontrol --cov-report=term-missing)",
       "Bash(python -c ' *)",
-      "Bash(pip install *)"
+      "Bash(pip install *)",
+      "Bash(head -302 /usr/aditya/aditya/wancontrol1/SDWANcontrol/wancontrol/network.py)",
+      "Read(//tmp/**)",
+      "Bash(python3 -m pytest tests/unit/test_network.py -v)"
     ]
   }
 }

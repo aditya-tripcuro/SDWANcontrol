@@ -1,3 +1,4 @@
+"""Entry point: python3 -m wancontrol"""
 from __future__ import annotations
 
 import os
@@ -213,7 +214,7 @@ def main() -> int:
             "Signal received (%s), shutting down", sig_name,
             extra={"component": "main"},
         )
-        controller.stop()
+        controller.shutdown()
         watchdog.stop()
         # Gunicorn handles its own shutdown when it receives SIGTERM/SIGINT
 

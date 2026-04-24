@@ -1,622 +1,302 @@
 """
 wancontrol/network.py
 ~~~~~~~~~~~~~~~~~~~~~
-Network layer for WANControl v2.
+Network utilities: snapshot/restore default routes, per-interface routing
+tables, and socket binding helpers.
 
-All Linux subprocess and iproute2 calls live exclusively in this module.
-No other module may call subprocess directly for network commands.
-
-Execution modes (controlled by WANCONTROL_DRY_RUN env var):
-  WANCONTROL_DRY_RUN=0 (default) — runs real commands
-  WANCONTROL_DRY_RUN=1           — skips all subprocess calls, logs what
-                                    would have run, returns safe defaults.
+All subprocess invocations use subprocess.run(..., check=True, capture_output=True, text=True)
+and errors are handled and logged with component="network".
 """
-
 from __future__ import annotations
 
 import json
 import logging
 import os
-import re
-import shutil
+import socket
 import subprocess
-from pathlib import Path
+from typing import Any
 
-# ── Dry-run mode ─────────────────────────────────────────────────────────────
-
-DRY_RUN: bool = os.environ.get("WANCONTROL_DRY_RUN", "0") == "1"
+from wancontrol.config import InterfaceConfig, Config
+from wancontrol.database import Database
 
 logger = logging.getLogger(__name__)
 
-_LOG_EXTRA: dict[str, str] = {"component": "network"}
 
+def snapshot_default_routes(db: Database) -> None:
+    """Snapshot current default routes and persist the raw JSON to DB.
 
-# ── Internal helper ──────────────────────────────────────────────────────────
-
-def _run(
-    args: list[str],
-    timeout: int = 10,
-    check_sudo: bool = False,
-) -> tuple[bool, str, str]:
-    """
-    Run a subprocess command.
-
-    Returns (success, stdout, stderr).
-    Logs stderr at DEBUG on failure.
-    If check_sudo=True and sudo fails with 'password is required', logs an
-    actionable ERROR message pointing the operator to visudo.
-    Never raises.
+    Stores the JSON string at state key "pre_start_default_routes".
     """
     try:
-        result = subprocess.run(
-            args,
-            shell=False,
+        res = subprocess.run(
+            ["ip", "-json", "route", "show", "default"],
+            check=True,
             capture_output=True,
-            timeout=timeout,
             text=True,
         )
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        success = result.returncode == 0
+    except subprocess.CalledProcessError as exc:
+        logger.error("Failed to snapshot default routes: %s", exc, extra={"component": "network"})
+        return
 
-        if not success:
-            if check_sudo and "password is required" in stderr:
-                logger.error(
-                    "sudo password required while running '%s' — grant passwordless "
-                    "sudo for this command via 'sudo visudo', or run WANControl as root.",
-                    args[0],
-                    extra=_LOG_EXTRA,
-                )
-            else:
-                logger.debug(
-                    "Command failed (rc=%d): %s | stderr: %s",
-                    result.returncode,
-                    " ".join(args),
-                    stderr,
-                    extra=_LOG_EXTRA,
-                )
-
-        return success, stdout, stderr
-
-    except subprocess.TimeoutExpired:
-        logger.debug(
-            "Command timed out: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return False, "", "timeout"
-
-    except subprocess.SubprocessError as exc:
-        logger.debug(
-            "SubprocessError running %s: %s", " ".join(args), exc,
-            extra=_LOG_EXTRA,
-        )
-        return False, "", str(exc)
-
-    except OSError as exc:
-        logger.debug(
-            "OSError running %s: %s", " ".join(args), exc,
-            extra=_LOG_EXTRA,
-        )
-        return False, "", str(exc)
-
-
-# ── Interface information ─────────────────────────────────────────────────────
-
-def get_interface_ip(interface: str) -> str | None:
-    """
-    Return the first IPv4 address of interface, or None if not found.
-
-    Command: ip -4 -o addr show dev <interface>
-    Parses field 3 of output and strips the prefix length (e.g. /24).
-    """
-    args = ["ip", "-4", "-o", "addr", "show", "dev", interface]
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return None
-
-    success, stdout, _ = _run(args)
-    if not success or not stdout.strip():
-        return None
-
-    for line in stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 4:
-            return parts[3].split("/")[0]
-
-    return None
-
-
-def get_interface_ip6(interface: str) -> str | None:
-    """
-    Return the first IPv6 address of interface, or None.
-
-    Command: ip -6 -o addr show dev <interface>
-    Parses field 3 of output and strips the prefix length.
-    """
-    args = ["ip", "-6", "-o", "addr", "show", "dev", interface]
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return None
-
-    success, stdout, _ = _run(args)
-    if not success or not stdout.strip():
-        return None
-
-    for line in stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 4:
-            return parts[3].split("/")[0]
-
-    return None
-
-
-def get_default_gateway() -> tuple[str, str] | None:
-    """
-    Return (gateway_ip, interface) of the current default route, or None.
-
-    Command: ip -j route show default
-    Parses JSON output; uses the first entry whose dst == "default".
-    """
-    args = ["ip", "-j", "route", "show", "default"]
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return None
-
-    success, stdout, _ = _run(args)
-    if not success or not stdout.strip():
-        return None
+    raw = res.stdout.strip() or "[]"
+    try:
+        parsed = json.loads(raw)
+        count = len(parsed) if isinstance(parsed, list) else 0
+    except json.JSONDecodeError:
+        count = 0
 
     try:
-        routes = json.loads(stdout)
+        db.set_state("pre_start_default_routes", raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to persist default routes snapshot: %s", exc, extra={"component": "network"})
+
+    logger.info("Snapshotted %d default route(s)", count, extra={"component": "network"})
+
+
+def restore_default_routes(db: Database) -> None:
+    """Restore default routes from the DB snapshot.
+
+    If the snapshot is missing or invalid, attempts a best-effort fallback
+    using the DB state key "active_interface" (interpreted as a gateway).
+    This function is idempotent.
+    """
+    raw = db.get_state("pre_start_default_routes")
+    routes: list[dict[str, Any]] | None = None
+
+    if raw:
+        try:
+            routes_parsed = json.loads(raw)
+            if isinstance(routes_parsed, list):
+                routes = routes_parsed
+        except json.JSONDecodeError:
+            logger.critical("pre_start_default_routes is invalid JSON", extra={"component": "network"})
+
+    if not routes:
+        # Best-effort fallback
+        gw = db.get_state("active_interface")
+        if not gw:
+            logger.critical("No snapshot and no active_interface state; cannot restore routes", extra={"component": "network"})
+            return
+        cmd = ["ip", "route", "replace", "default", "via", gw]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info("Restored default route via %s (fallback)", gw, extra={"component": "network"})
+        except subprocess.CalledProcessError as exc:
+            logger.critical("Fallback restore failed: %s", exc, extra={"component": "network"})
+        return
+
+    for r in routes:
+        cmd = ["ip", "route", "replace", "default"]
+        # include attributes only if present
+        if "via" in r and r["via"]:
+            cmd += ["via", str(r["via"])]
+        if "dev" in r and r["dev"]:
+            cmd += ["dev", str(r["dev"])]
+        if "metric" in r and r["metric"] is not None:
+            cmd += ["metric", str(r["metric"])]
+        if "proto" in r and r["proto"]:
+            cmd += ["proto", str(r["proto"])]
+        if "table" in r and r["table"] is not None:
+            cmd += ["table", str(r["table"])]
+        if "onlink" in r and r["onlink"]:
+            cmd += ["onlink"]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info("Restored default route: %s", " ".join(cmd[4:]), extra={"component": "network"})
+        except subprocess.CalledProcessError as exc:
+            logger.error("Failed to restore route %s: %s", cmd, exc, extra={"component": "network"})
+
+
+def get_interface_subnet(iface: str) -> str:
+    """Return the first IPv4 CIDR (e.g. "192.168.2.100/24") for the given interface.
+
+    Raises ValueError if no IPv4 address is found.
+    """
+    try:
+        res = subprocess.run(
+            ["ip", "-json", "addr", "show", "dev", iface],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.error("ip addr show failed for %s: %s", iface, exc, extra={"component": "network"})
+        raise ValueError(f"Could not get address for interface {iface}") from exc
+
+    try:
+        parsed = json.loads(res.stdout or "[]")
     except json.JSONDecodeError as exc:
-        logger.debug(
-            "Failed to parse JSON from 'ip -j route': %s", exc,
-            extra=_LOG_EXTRA,
-        )
-        return None
+        logger.error("Failed to parse ip addr output for %s: %s", iface, exc, extra={"component": "network"})
+        raise ValueError(f"Invalid ip addr output for {iface}") from exc
 
-    for route in routes:
-        if route.get("dst") == "default":
-            gateway = route.get("gateway")
-            iface = route.get("dev")
-            if gateway and iface:
-                return gateway, iface
+    if not parsed:
+        raise ValueError(f"No address info for interface {iface}")
 
-    return None
+    # parsed is a list; look for addr_info entries with family == 'inet'
+    for entry in parsed:
+        addr_info = entry.get("addr_info") or []
+        for a in addr_info:
+            family = a.get("family")
+            if family == "inet":
+                # prefer explicit cidr if present
+                if "local" in a and "prefixlen" in a:
+                    return f"{a['local']}/{a['prefixlen']}"
+                if "cidr" in a:
+                    return a["cidr"]
+
+    raise ValueError(f"No IPv4 address found for interface {iface}")
 
 
-def get_interface_stats(interface: str) -> dict[str, int]:
+def setup_interface_routing(iface_cfg: InterfaceConfig) -> None:
+    """Create a per-interface routing table and policy rule.
+
+    Always logs each command at DEBUG before executing it.
     """
-    Return rx/tx byte and packet counters for interface.
-
-    Reads /proc/net/dev directly (no subprocess).
-    Returns {"rx_bytes": N, "tx_bytes": N, "rx_packets": N, "tx_packets": N}.
-    Returns all zeros if interface is not found.
-    """
-    zeros: dict[str, int] = {
-        "rx_bytes": 0,
-        "tx_bytes": 0,
-        "rx_packets": 0,
-        "tx_packets": 0,
-    }
+    # route replace default via <gateway> dev <name> table <routing_table_id>
+    cmd_route = [
+        "ip", "route", "replace", "default",
+        "via", iface_cfg.gateway,
+        "dev", iface_cfg.name,
+        "table", str(iface_cfg.routing_table_id),
+    ]
+    logger.debug("Running: %s", " ".join(cmd_route), extra={"component": "network"})
+    try:
+        subprocess.run(cmd_route, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        logger.error("Failed to set route for %s: %s", iface_cfg.name, exc, extra={"component": "network"})
 
     try:
-        text = Path("/proc/net/dev").read_text()
+        subnet = get_interface_subnet(iface_cfg.name)
+    except ValueError as exc:
+        logger.error("Cannot determine subnet for %s: %s", iface_cfg.name, exc, extra={"component": "network"})
+        return
+
+    # Check existing rules
+    try:
+        res = subprocess.run(
+            ["ip", "rule", "list"], check=True, capture_output=True, text=True
+        )
+        rules_text = res.stdout or ""
+    except subprocess.CalledProcessError as exc:
+        logger.error("Failed to list ip rules: %s", exc, extra={"component": "network"})
+        rules_text = ""
+
+    rule_sig = f"from {subnet} lookup {iface_cfg.routing_table_id}"
+    if rule_sig in rules_text:
+        logger.debug("Rule already exists for %s: %s", iface_cfg.name, rule_sig, extra={"component": "network"})
+        return
+
+    cmd_rule = [
+        "ip", "rule", "add", "from", subnet, "lookup", str(iface_cfg.routing_table_id), "priority", str(iface_cfg.routing_table_id)
+    ]
+    logger.debug("Running: %s", " ".join(cmd_rule), extra={"component": "network"})
+    try:
+        subprocess.run(cmd_rule, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        logger.error("Failed to add ip rule for %s: %s", iface_cfg.name, exc, extra={"component": "network"})
+
+
+def teardown_interface_routing(iface_cfg: InterfaceConfig) -> None:
+    """Remove ip rule and table route for the interface. Logs warnings on failures.
+
+    This function never raises.
+    """
+    try:
+        subnet = get_interface_subnet(iface_cfg.name)
+    except ValueError:
+        subnet = None
+
+    if subnet:
+        cmd_del_rule = ["ip", "rule", "del", "from", subnet, "lookup", str(iface_cfg.routing_table_id)]
+        try:
+            subprocess.run(cmd_del_rule, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            logger.warning("Failed to delete ip rule for %s: %s", iface_cfg.name, exc, extra={"component": "network"})
+
+    cmd_del_route = ["ip", "route", "del", "default", "table", str(iface_cfg.routing_table_id)]
+    try:
+        subprocess.run(cmd_del_route, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        logger.warning("Failed to delete route table %s: %s", iface_cfg.routing_table_id, exc, extra={"component": "network"})
+
+
+def setup_all_interfaces(interfaces: list[InterfaceConfig]) -> None:
+    """Setup routing for all configured interfaces.
+
+    Logs a summary at INFO when complete.
+    """
+    for iface in interfaces:
+        setup_interface_routing(iface)
+    logger.info("Setup routing for %d interface(s)", len(interfaces), extra={"component": "network"})
+
+
+def teardown_all_interfaces(interfaces: list[InterfaceConfig]) -> None:
+    """Teardown routing for all interfaces. Never raises; logs failures and continues."""
+    for iface in interfaces:
+        try:
+            teardown_interface_routing(iface)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unexpected error tearing down %s: %s", iface.name, exc, extra={"component": "network"})
+
+
+def bind_socket_to_interface(sock: socket.socket, iface_name: str) -> None:
+    """Bind a socket to an interface using SO_BINDTODEVICE.
+
+    Always call `bind_socket_to_interface` before sending — unbound probes on
+    multi-WAN hosts will use the kernel default and give false positives.
+
+    Raises PermissionError if the operation is not permitted (e.g. CAP_NET_RAW).
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface_name.encode())
     except OSError as exc:
-        logger.debug(
-            "Cannot read /proc/net/dev: %s", exc, extra=_LOG_EXTRA
-        )
-        return zeros
-
-    for line in text.splitlines():
-        if ":" not in line:
-            continue
-        iface_part, data_part = line.split(":", 1)
-        if iface_part.strip() == interface:
-            fields = data_part.split()
-            # /proc/net/dev columns (after the colon):
-            # 0:rx_bytes 1:rx_packets 2:rx_errs 3:rx_drop 4:rx_fifo
-            # 5:rx_frame 6:rx_compressed 7:rx_multicast
-            # 8:tx_bytes 9:tx_packets ...
-            if len(fields) >= 10:
-                return {
-                    "rx_bytes": int(fields[0]),
-                    "rx_packets": int(fields[1]),
-                    "tx_bytes": int(fields[8]),
-                    "tx_packets": int(fields[9]),
-                }
-
-    return zeros
+        raise PermissionError(
+            "Binding socket to device failed. Ensure the process has CAP_NET_RAW/CAP_NET_ADMIN or is running as root."
+        ) from exc
 
 
-# ── Route management ──────────────────────────────────────────────────────────
+def find_available_port(start: int = 5000, max_attempts: int = 10) -> int:
+    """Find an available TCP port starting at `start` trying `max_attempts` ports.
 
-def set_default_route(gateway: str, interface: str) -> bool:
+    Logs the selected port at INFO.
     """
-    Replace the default route.
-
-    Commands (in order):
-      sudo ip route del default          (ignore failure — may not exist)
-      sudo ip route add default via <gateway> dev <interface>
-
-    Returns True only if the add command succeeds.
-    Requires sudo.
-    """
-    del_args = ["sudo", "ip", "route", "del", "default"]
-    add_args = ["sudo", "ip", "route", "add", "default", "via", gateway, "dev", interface]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(del_args), extra=_LOG_EXTRA
-        )
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(add_args), extra=_LOG_EXTRA
-        )
-        return True
-
-    _run(del_args, check_sudo=True)  # ignore failure — route may not exist
-    success, _, _ = _run(add_args, check_sudo=True)
-    return success
-
-
-def set_load_balance_route(
-    nexthops: list[tuple[str, str, int]],
-) -> bool:
-    """
-    Set a multipath default route for load balancing.
-
-    nexthops is a list of (gateway, interface, weight).
-
-    Commands:
-      sudo ip route del default
-      sudo ip route add default \\
-        nexthop via <gw1> dev <iface1> weight <w1> \\
-        nexthop via <gw2> dev <iface2> weight <w2> ...
-
-    Raises ValueError if nexthops is empty.
-    Requires sudo.
-    """
-    if not nexthops:
-        raise ValueError("nexthops must not be empty")
-
-    del_args = ["sudo", "ip", "route", "del", "default"]
-    add_args = ["sudo", "ip", "route", "add", "default"]
-    for gw, iface, weight in nexthops:
-        add_args.extend(["nexthop", "via", gw, "dev", iface, "weight", str(weight)])
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(del_args), extra=_LOG_EXTRA
-        )
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(add_args), extra=_LOG_EXTRA
-        )
-        return True
-
-    _run(del_args, check_sudo=True)  # ignore failure
-    success, _, _ = _run(add_args, check_sudo=True)
-    return success
-
-
-def add_policy_route_table(
-    table_id: int,
-    interface: str,
-    gateway: str,
-    iface_ip: str,
-    network_cidr: str,
-) -> bool:
-    """
-    Configure a per-interface policy routing table.
-
-    Commands:
-      sudo ip route add <network_cidr> dev <interface> src <iface_ip> table <table_id>
-      sudo ip route add default via <gateway> dev <interface> table <table_id>
-
-    Both must succeed. Returns True only if both succeed.
-    Requires sudo.
-    """
-    net_args = [
-        "sudo", "ip", "route", "add",
-        network_cidr, "dev", interface,
-        "src", iface_ip, "table", str(table_id),
-    ]
-    gw_args = [
-        "sudo", "ip", "route", "add", "default",
-        "via", gateway, "dev", interface, "table", str(table_id),
-    ]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(net_args), extra=_LOG_EXTRA
-        )
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(gw_args), extra=_LOG_EXTRA
-        )
-        return True
-
-    success1, _, _ = _run(net_args, check_sudo=True)
-    if not success1:
-        return False
-
-    success2, _, _ = _run(gw_args, check_sudo=True)
-    return success2
-
-
-def flush_policy_route_table(table_id: int) -> bool:
-    """
-    Remove all routes in a policy routing table.
-
-    Command: sudo ip route flush table <table_id>
-    Requires sudo.
-    """
-    args = ["sudo", "ip", "route", "flush", "table", str(table_id)]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return True
-
-    success, _, _ = _run(args, check_sudo=True)
-    return success
-
-
-def add_policy_rule(table_id: int, iface_ip: str) -> bool:
-    """
-    Add an ip rule to route traffic from iface_ip via table_id.
-
-    Command: sudo ip rule add from <iface_ip> table <table_id> priority <table_id>
-
-    Returns False if the rule already exists (not an error; logs INFO).
-    Requires sudo.
-    """
-    args = [
-        "sudo", "ip", "rule", "add",
-        "from", iface_ip,
-        "table", str(table_id),
-        "priority", str(table_id),
-    ]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return True
-
-    success, _, stderr = _run(args, check_sudo=True)
-
-    if not success:
-        if "already exists" in stderr or "File exists" in stderr:
-            logger.info(
-                "Policy rule for table %d (from %s) already exists — skipping.",
-                table_id, iface_ip,
-                extra=_LOG_EXTRA,
-            )
-        return False
-
-    return True
-
-
-def remove_policy_rule(table_id: int) -> bool:
-    """
-    Remove the ip rule for table_id.
-
-    Command: sudo ip rule del priority <table_id>
-    Returns True even if the rule did not exist.
-    Requires sudo.
-    """
-    args = ["sudo", "ip", "rule", "del", "priority", str(table_id)]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return True
-
-    _run(args, check_sudo=True)  # ignore failure — rule may not exist
-    return True
-
-
-# ── System configuration ──────────────────────────────────────────────────────
-
-def enable_ip_forwarding() -> bool:
-    """
-    Enable IPv4 forwarding.
-
-    Command: sudo sysctl -w net.ipv4.ip_forward=1
-    Requires sudo.
-    """
-    args = ["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return True
-
-    success, _, _ = _run(args, check_sudo=True)
-    return success
-
-
-def enable_rp_filter_loose(interface: str) -> bool:
-    """
-    Set reverse path filter to loose mode for interface.
-
-    Command: sudo sysctl -w net.ipv4.conf.<interface>.rp_filter=2
-    Requires sudo.
-    """
-    args = ["sudo", "sysctl", "-w", f"net.ipv4.conf.{interface}.rp_filter=2"]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return True
-
-    success, _, _ = _run(args, check_sudo=True)
-    return success
-
-
-def check_prerequisites() -> list[str]:
-    """
-    Check that required commands exist: ip, ping, dig, curl, sysctl.
-
-    Uses shutil.which() — no subprocess calls.
-    Returns a list of missing command names. An empty list means all present.
-    """
-    required = ["ip", "ping", "dig", "curl", "sysctl"]
-    return [cmd for cmd in required if shutil.which(cmd) is None]
-
-
-# ── Connectivity probe helpers ────────────────────────────────────────────────
-
-def probe_icmp(
-    interface: str,
-    target: str,
-    count: int,
-    timeout_sec: int,
-) -> tuple[float, float, float]:
-    """
-    Run a ping probe bound to interface.
-
-    Command: ping -I <interface> -c <count> -W <timeout_sec> <target>
-
-    Returns (avg_latency_ms, jitter_ms, loss_pct).
-    Returns (0.0, 0.0, 100.0) on any failure.
-
-    Parses:
-      "rtt min/avg/max/mdev = 1.234/5.678/9.012/1.234 ms"  → avg, jitter
-      "N packets transmitted, M received, X% packet loss"   → loss_pct
-    """
-    failure = (0.0, 0.0, 100.0)
-    args = [
-        "ping", "-I", interface,
-        "-c", str(count),
-        "-W", str(timeout_sec),
-        target,
-    ]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return failure
-
-    success, stdout, _ = _run(args, timeout=timeout_sec * count + 5)
-    if not success:
-        return failure
-
-    avg_latency_ms = 0.0
-    jitter_ms = 0.0
-    loss_pct = 100.0
-
-    for line in stdout.splitlines():
-        # "rtt min/avg/max/mdev = 1.234/5.678/9.012/1.234 ms"
-        if line.startswith("rtt ") and "=" in line:
+    for port in range(start, start + max_attempts):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", port))
+            s.close()
+            logger.info("Web server will bind on port %d", port, extra={"component": "network"})
+            return port
+        except OSError:
             try:
-                stats_str = line.split("=", 1)[1].strip().split("ms")[0].strip()
-                fields = stats_str.split("/")
-                if len(fields) >= 4:
-                    avg_latency_ms = float(fields[1])
-                    jitter_ms = float(fields[3])
-            except (ValueError, IndexError):
+                s.close()
+            except Exception:
                 pass
+            continue
 
-        # "N packets transmitted, M received, X% packet loss"
-        if "packet loss" in line:
-            m = re.search(r"(\d+(?:\.\d+)?)%\s+packet loss", line)
-            if m:
-                loss_pct = float(m.group(1))
-
-    return avg_latency_ms, jitter_ms, loss_pct
+    raise RuntimeError(f"No available port found in range {start}\u2013{start+max_attempts-1}")
 
 
-def probe_dns(
-    interface: str,
-    target: str,
-    timeout_sec: int,
-    iface_ip: str,
-) -> bool:
-    """
-    Run a DNS probe bound to the interface IP.
+if __name__ == "__main__":
+    import sys
 
-    Command: dig +short +time=<timeout_sec> +tries=1 -b <iface_ip> @<target> google.com
+    if "--restore-routes" in sys.argv:
+        cfg_path = os.environ.get("WANCONTROL_CONFIG", "/etc/wancontrol/config.yaml")
+        cfg = Config(cfg_path)
+        try:
+            app_cfg = cfg.load()
+        except Exception:
+            # continue with default DB path fallback
+            app_cfg = None
 
-    Returns True if the command succeeds and stdout is non-empty.
-    """
-    args = [
-        "dig", "+short",
-        f"+time={timeout_sec}", "+tries=1",
-        "-b", iface_ip,
-        f"@{target}", "google.com",
-    ]
+        db_path = app_cfg.db_path if app_cfg is not None else "/var/lib/wancontrol/wan.db"
+        db = Database(db_path)
+        try:
+            db.initialize()
+        except Exception:
+            # initialization may fail if DB already exists; proceed anyway
+            pass
+        restore_default_routes(db)
 
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return True
-
-    success, stdout, _ = _run(args, timeout=timeout_sec + 2)
-    return success and bool(stdout.strip())
-
-
-def probe_http(
-    interface: str,
-    target: str,
-    timeout_sec: int,
-) -> tuple[bool, float]:
-    """
-    Run an HTTP probe bound to interface.
-
-    Command:
-      curl --interface <interface> --max-time <timeout_sec>
-           --silent --output /dev/null
-           --write-out "%{http_code} %{time_total}"
-           <target>
-
-    Returns (success, response_time_ms).
-    success is True if http_code is 200 or 204.
-    response_time_ms = time_total * 1000.
-    Returns (False, 0.0) on any failure.
-    """
-    failure = (False, 0.0)
-    args = [
-        "curl",
-        "--interface", interface,
-        "--max-time", str(timeout_sec),
-        "--silent",
-        "--output", "/dev/null",
-        "--write-out", "%{http_code} %{time_total}",
-        target,
-    ]
-
-    if DRY_RUN:
-        logger.info(
-            "DRY RUN — would run: %s", " ".join(args), extra=_LOG_EXTRA
-        )
-        return failure
-
-    success, stdout, _ = _run(args, timeout=timeout_sec + 5)
-    if not success:
-        return failure
-
-    parts = stdout.strip().split()
-    if len(parts) < 2:
-        return failure
-
-    try:
-        http_code = int(parts[0])
-        time_total = float(parts[1])
-    except (ValueError, IndexError):
-        return failure
-
-    if http_code in {200, 204}:
-        return True, time_total * 1000.0
-
-    return False, 0.0

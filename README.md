@@ -1,10 +1,10 @@
 # WANControl v2
 
-SD-WAN load-balancing controller for Linux dual-WAN systems.
+SD-WAN load-balancing controller for Linux multi-WAN systems.
 
 ## Features
 
-- Dual-WAN `failover` and `load_balance` routing modes
+- Multi-WAN `failover` and `load_balance` routing modes (supports 2+ interfaces)
 - Continuous ICMP, DNS, and HTTP health probing with weighted scoring
 - Flask API plus React dashboard served from the same process
 - SQLite persistence for metrics, alerts, events, users, and API tokens
@@ -17,7 +17,7 @@ SD-WAN load-balancing controller for Linux dual-WAN systems.
 - Python 3.10+
 - `iproute2`, `iputils-ping`, `bind9-dnsutils`, `curl`
 - `sudo`, `systemd`, and optionally `npm` to rebuild the frontend
-- At least two WAN interfaces on the target Linux host
+- Two or more WAN interfaces on the target Linux host
 
 ## Quick Install
 
