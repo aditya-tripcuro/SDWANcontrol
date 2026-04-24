@@ -77,9 +77,6 @@ class Watchdog:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-        # Register signal handlers
-        self._install_signal_handlers()
-
         # Register atexit handler
         self._register_atexit()
 

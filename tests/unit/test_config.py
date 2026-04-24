@@ -234,8 +234,9 @@ class TestValidationErrors:
 
     # Server / secret_key ---------------------------------------------------------
 
-    def test_secret_key_is_placeholder_string(self, tmp_path: Path) -> None:
-        """Both the spec-prescribed placeholder and legacy placeholder are rejected."""
+    def test_secret_key_is_placeholder_string_without_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Placeholders are rejected unless WANCONTROL_SECRET_KEY is provided."""
+        monkeypatch.delenv("WANCONTROL_SECRET_KEY", raising=False)
         for placeholder in (
             "REPLACE_ME_run_python_secrets_token_hex_32",
             "CHANGE_THIS_TO_A_RANDOM_STRING_MIN_32_CHARS",
@@ -244,6 +245,13 @@ class TestValidationErrors:
             data["server"]["secret_key"] = placeholder
             with pytest.raises(ConfigError, match="secret_key"):
                 Config(_write(tmp_path, data)).load()
+
+    def test_secret_key_placeholder_is_allowed_with_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WANCONTROL_SECRET_KEY", "e" * 32)
+        data = _minimal_dict()
+        data["server"]["secret_key"] = "REPLACE_ME_run_python_secrets_token_hex_32"
+        result = Config(_write(tmp_path, data)).load()
+        assert result.server.secret_key == "e" * 32
 
     def test_secret_key_shorter_than_32(self, tmp_path: Path) -> None:
         data = _minimal_dict()

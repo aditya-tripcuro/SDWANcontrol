@@ -1,13 +1,57 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    """
+    Load key/value pairs from a local .env file into the process environment.
+
+    - Optional override path via WANCONTROL_DOTENV.
+    - Does not overwrite existing environment variables.
+    - Intentionally minimal parser: KEY=VALUE, optional 'export ' prefix,
+      ignores blank lines and '#'-comments.
+    """
+    override = os.environ.get("WANCONTROL_DOTENV")
+    dotenv_path = Path(override).expanduser() if override else (Path.cwd() / ".env")
+    if not dotenv_path.exists() or not dotenv_path.is_file():
+        return
+
+    try:
+        lines = dotenv_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+
+        os.environ[key] = value
+
+
+_load_dotenv()
+
 import dataclasses
 import logging
-import os
 import signal
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 from gunicorn.app.base import BaseApplication
@@ -105,44 +149,6 @@ class _GunicornApplication(BaseApplication):
         return self._app
 
 
-def _start_debug_server(app: Any, host: str, port: int) -> threading.Thread:
-    def _run() -> None:
-        logger.info(
-            "Starting Flask development server",
-            extra={"component": "main"},
-        )
-        app.run(host=host, port=port, debug=True, use_reloader=False, threaded=True)
-
-    thread = threading.Thread(target=_run, name="wancontrol-flask", daemon=True)
-    thread.start()
-    return thread
-
-
-def _start_gunicorn(app: Any, host: str, port: int) -> threading.Thread:
-    options = {
-        "bind": f"{host}:{port}",
-        "workers": 1,
-        "threads": 4,
-        "worker_class": "gthread",
-        "timeout": 30,
-        "keepalive": 5,
-        "accesslog": "-",
-        "errorlog": "-",
-        "loglevel": "warning",
-    }
-
-    def _run() -> None:
-        logger.info(
-            "Starting gunicorn HTTP server",
-            extra={"component": "main"},
-        )
-        _GunicornApplication(app, options).run()
-
-    thread = threading.Thread(target=_run, name="wancontrol-gunicorn", daemon=True)
-    thread.start()
-    return thread
-
-
 def main() -> int:
     config_path = Path(_env_text("WANCONTROL_CONFIG") or "/etc/wancontrol/config.yaml")
     log_level = (_env_text("WANCONTROL_LOG_LEVEL") or "INFO").upper()
@@ -155,7 +161,7 @@ def main() -> int:
     cfg_loader = Config(config_path)
     try:
         cfg = cfg_loader.load()
-    except FileNotFoundError as exc:
+    except FileNotFoundError:
         logger.critical(
             "Config file not found: %s",
             config_path,
@@ -198,8 +204,40 @@ def main() -> int:
     controller = Controller(cfg, db)
     watchdog = Watchdog(cfg, db, controller)
 
-    cfg_loader.register_sighup()
+    # ── Signal Handlers ───────────────────────────────────────────────────
+    # Signals must be registered in the main thread.
+    
+    def _shutdown_handler(signum: int, frame: object) -> None:
+        sig_name = signal.Signals(signum).name
+        logger.info(
+            "Signal received (%s), shutting down", sig_name,
+            extra={"component": "main"},
+        )
+        controller.stop()
+        watchdog.stop()
+        # Gunicorn handles its own shutdown when it receives SIGTERM/SIGINT
+
+    def _reload_handler(signum: int, frame: object) -> None:
+        logger.info("SIGHUP received — reloading config", extra={"component": "main"})
+        cfg_loader.reload()
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+    signal.signal(signal.SIGHUP, _reload_handler)
+
+    # ── Start Background Tasks ────────────────────────────────────────────
+
     watchdog.start()
+
+    # Controller.start() is blocking (runs the master loop), so run it in a thread.
+    controller_thread = threading.Thread(
+        target=controller.start,
+        name="wancontrol-controller",
+        daemon=True,
+    )
+    controller_thread.start()
+
+    # ── Start Web Server ──────────────────────────────────────────────────
 
     app = create_app(cfg, cfg_loader, db, controller)
 
@@ -213,34 +251,24 @@ def main() -> int:
 
     _print_banner(config_path, cfg)
 
-    server_thread = _start_debug_server(app, cfg.server.host, cfg.server.port) if debug_mode else _start_gunicorn(
-        app,
-        cfg.server.host,
-        cfg.server.port,
-    )
-
-    time.sleep(0.25)
-    if not server_thread.is_alive():
-        logger.critical(
-            "HTTP server failed to start",
-            extra={"component": "main"},
-        )
-        return 1
-
-    try:
-        controller.start()
-    except KeyboardInterrupt:
-        logger.info(
-            "Keyboard interrupt received",
-            extra={"component": "main"},
-        )
-        watchdog._handle_signal(signal.SIGINT, None)  # type: ignore[arg-type]
-    except Exception:
-        logger.exception(
-            "Fatal error in controller loop",
-            extra={"component": "main"},
-        )
-        return 1
+    if debug_mode:
+        logger.info("Starting Flask development server", extra={"component": "main"})
+        # Flask's debug server also registers signals unless use_reloader=False
+        app.run(host=cfg.server.host, port=cfg.server.port, debug=True, use_reloader=False)
+    else:
+        logger.info("Starting gunicorn HTTP server", extra={"component": "main"})
+        options = {
+            "bind": f"{cfg.server.host}:{cfg.server.port}",
+            "workers": 1,
+            "threads": 4,
+            "worker_class": "gthread",
+            "timeout": 30,
+            "keepalive": 5,
+            "accesslog": "-",
+            "errorlog": "-",
+            "loglevel": "warning",
+        }
+        _GunicornApplication(app, options).run()
 
     return 0
 

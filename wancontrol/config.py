@@ -291,17 +291,22 @@ def _parse_alerting(raw: dict) -> AlertingConfig:
 
 def _parse_server(raw: dict) -> ServerConfig:
     s = "server"
-    secret = str(_require(raw, "secret_key", s))
+    secret = str(_require(raw, "secret_key", s)).strip()
     _PLACEHOLDER_KEYS = {
         "CHANGE_THIS_TO_A_RANDOM_STRING",
         "CHANGE_THIS_TO_A_RANDOM_STRING_MIN_32_CHARS",
         "REPLACE_ME_run_python_secrets_token_hex_32",
     }
     if secret in _PLACEHOLDER_KEYS:
-        raise ConfigError(
-            "[server].secret_key is still the default placeholder. "
-            "Generate a random string: python -c \"import secrets; print(secrets.token_hex(32))\""
-        )
+        env_secret = os.environ.get("WANCONTROL_SECRET_KEY", "").strip()
+        if env_secret and env_secret not in _PLACEHOLDER_KEYS:
+            secret = env_secret
+        else:
+            raise ConfigError(
+                "[server].secret_key is still the default placeholder. "
+                "Set WANCONTROL_SECRET_KEY (recommended) or replace server.secret_key in config.yaml. "
+                "Generate a random string: python3 -c \"import secrets; print(secrets.token_hex(32))\""
+            )
     if len(secret) < 32:
         raise ConfigError("[server].secret_key must be at least 32 characters")
     return ServerConfig(
@@ -402,14 +407,6 @@ class Config:
                 logger.warning("Reload callback raised: %s", exc, extra={"component": "config"})
 
         return new_cfg
-
-    def register_sighup(self) -> None:
-        """Register SIGHUP handler to trigger hot-reload."""
-        def _handler(signum: int, frame: object) -> None:  # noqa: ARG001
-            logger.info("SIGHUP received — reloading config", extra={"component": "config"})
-            self.reload()
-
-        signal.signal(signal.SIGHUP, _handler)
 
     def on_reload(self, callback: Callable[[AppConfig], None]) -> None:
         """Register a callback(new_config: AppConfig) called after successful reload."""

@@ -27,7 +27,6 @@ interfaces:
 # load_balance : All healthy WANs active; weighted by expected_speed_mbps.
 wan_mode: "load_balance"
 
-
 # ── Probes ────────────────────────────────────────────────────────────────────
 probes:
   interval_sec: 1
@@ -96,13 +95,14 @@ alerting:
 server:
   host: "0.0.0.0"
   port: 5000
-  # Generate a real key: python -c "import secrets; print(secrets.token_hex(32))"
+  # Recommended: set WANCONTROL_SECRET_KEY via .env and keep this as a placeholder.
+  # Generate a real key: python3 -c "import secrets; print(secrets.token_hex(32))"
   secret_key: "REPLACE_ME_run_python_secrets_token_hex_32"
   jwt_expiry_hours: 24
   session_timeout_minutes: 60
 
 # ── File Paths ────────────────────────────────────────────────────────────────
-lock_file: "/run/wancontrol/controller.lock"
-heartbeat_file: "/run/wancontrol/controller.heartbeat"
-db_path: "/var/lib/wancontrol/wan.db"
-log_dir: "/var/lib/wancontrol/logs"
+lock_file: "./controller.lock"
+heartbeat_file: "./controller.heartbeat"
+db_path: "./wan.db"
+log_dir: "./logs"
