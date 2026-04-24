@@ -4,24 +4,29 @@
 
 # ── WAN Interfaces ────────────────────────────────────────────────────────────
 interfaces:
-  - name: "wan0"
-    label: "Fiber Primary"
-    expected_speed_mbps: 100
+  - name: "enp2s0"
+    label: "LAN-1 (Primary)"
+    expected_speed_mbps: 1000
     gateway: "192.168.1.1"
     routing_table_id: 100
 
-  - name: "wan1"
-    label: "BSNL Backup"
-    expected_speed_mbps: 30
-    gateway: "10.0.0.1"
+  - name: "enp3s0"
+    label: "LAN-2 (Backup)"
+    expected_speed_mbps: 100
+    gateway: "192.168.11.1"
     routing_table_id: 101
+
+  - name: "wlp5s0"
+    label: "WiFi"
+    expected_speed_mbps: 100
+    gateway: "192.168.0.1"
+    routing_table_id: 102
 
 # ── WAN Mode ──────────────────────────────────────────────────────────────────
 # failover     : One active WAN at a time; switch on failure.
 # load_balance : All healthy WANs active; weighted by expected_speed_mbps.
-#                Per-connection distribution (not per-packet).
-#                Bandwidth degrades gracefully when a WAN fails.
 wan_mode: "load_balance"
+
 
 # ── Probes ────────────────────────────────────────────────────────────────────
 probes:
