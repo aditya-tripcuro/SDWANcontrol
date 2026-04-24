@@ -8,26 +8,75 @@ const LoginPage: React.FC = () => {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setLoading(true);
+    setError(null);
     try {
       await auth.login(username, password);
       nav("/", { replace: true });
     } catch (err) {
-      setError("Invalid username or password");
+      setError("Invalid credentials. Please verify your access tokens.");
+    } finally {
+      setLoading(false);
     }
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center">
-      <form onSubmit={submit} className="bg-slate-900 p-8 rounded-md w-full max-w-md">
-        <h1 className="text-2xl font-bold mb-4">WANControl v2.0.0-dev</h1>
-        {error && <div className="text-red-400 mb-2">{error}</div>}
-        <label className="block mb-2">Username<input value={username} onChange={(e)=>setUsername(e.target.value)} className="w-full p-2 bg-slate-800 rounded mt-1"/></label>
-        <label className="block mb-4">Password<input type="password" value={password} onChange={(e)=>setPassword(e.target.value)} className="w-full p-2 bg-slate-800 rounded mt-1"/></label>
-        <button className="w-full bg-slate-700 py-2 rounded">Sign in</button>
-      </form>
+    <div className="min-h-screen bg-canvas flex flex-col items-center justify-center p-6 text-text-strong font-sans">
+      <div className="w-full max-w-md space-y-8">
+        <div className="text-center space-y-4">
+          <div className="inline-flex items-center justify-center w-16 h-16 bg-brand-primary rounded-base shadow-2xl shadow-brand-primary/20 mb-4">
+            <span className="text-2xl font-bold">WC</span>
+          </div>
+          <h1 className="text-2xl font-bold tracking-tight uppercase">WANControl v2</h1>
+          <p className="text-sm text-text-muted">Network Operations Management System</p>
+        </div>
+
+        <form onSubmit={submit} className="bg-surface p-8 rounded-base border border-white/5 shadow-2xl space-y-6">
+          {error && (
+            <div className="bg-status-error/10 border border-status-error/20 p-4 rounded-sm flex items-start space-x-3">
+              <svg className="w-4 h-4 text-status-error mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+              <span className="text-xs font-medium text-status-error">{error}</span>
+            </div>
+          )}
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-[10px] font-bold text-text-muted uppercase tracking-widest">Username / Identifier</label>
+              <input 
+                value={username} 
+                onChange={(e)=>setUsername(e.target.value)} 
+                className="w-full bg-canvas border border-white/10 rounded-sm px-4 py-3 text-xs text-text-strong focus:outline-none focus:border-brand-primary transition-colors"
+                placeholder="system-admin"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] font-bold text-text-muted uppercase tracking-widest">Access Key / Password</label>
+              <input 
+                type="password" 
+                value={password} 
+                onChange={(e)=>setPassword(e.target.value)} 
+                className="w-full bg-canvas border border-white/10 rounded-sm px-4 py-3 text-xs text-text-strong focus:outline-none focus:border-brand-primary transition-colors"
+                placeholder="••••••••"
+              />
+            </div>
+          </div>
+
+          <button 
+            disabled={loading}
+            className={`w-full bg-brand-primary py-3 rounded-sm text-[10px] font-bold uppercase tracking-[0.2em] hover:shadow-lg hover:shadow-brand-primary/10 transition-all ${loading ? 'opacity-50 cursor-not-allowed' : ''}`}
+          >
+            {loading ? "Authenticating..." : "Establish Session"}
+          </button>
+        </form>
+
+        <div className="text-center">
+           <p className="text-[10px] text-text-muted uppercase tracking-widest">Authorized Personnel Only</p>
+        </div>
+      </div>
     </div>
   );
 };

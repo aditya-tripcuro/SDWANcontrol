@@ -43,9 +43,15 @@ WANControl v2 is a production-grade SD-WAN load-balancing controller for Linux (
 - **Auth**: Flexible JWT-based sessions or persistent API tokens with role-based access control (Admin, Operator, Viewer).
 
 ## Frontend Design (`frontend/`, `DESIGN.md`)
-- **Aesthetic**: "Industrial Precision" — a Slate-based dark mode optimized for technical density.
-- **Pages**: Dashboard (live status), Metrics (charts), Events, Alerts, Users, and Config.
-- **SSE Integration**: `sse.ts` manages resilient EventSource connections with exponential backoff.
+- **Aesthetic**: "Industrial Precision" — a Slate-based dark mode optimized for technical density, high contrast, and functional monitoring.
+- **Layout**: Features a fixed Left Sidebar for desktop, a Glassmorphic Top Header, and a persistent Bottom Navigation bar for mobile devices.
+- **Pages**:
+  - **Dashboard**: Real-time metrics visualization (Latency, Jitter, Loss, Throughput) using Area Charts and connection tables.
+  - **Metrics**: Detailed interface comparison and latency distribution histograms.
+  - **Config**: Multi-tab configuration interface (General, Interfaces, Routing, Monitoring).
+  - **Events & Alerts**: Dedicated chronological audit logs and incident management views.
+- **Tech Stack**: React 18, TypeScript, TailwindCSS, Recharts.
+- **SSE Integration**: `sse.ts` manages resilient EventSource connections with exponential backoff for live updates.
 
 ## Deployment (`install.sh`, `deploy/`)
 - **System Integration**: Deploys as a `systemd` service under a dedicated `wancontrol` system user.

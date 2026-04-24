@@ -6,7 +6,8 @@ SD-WAN load-balancing controller for Linux multi-WAN systems.
 
 - Multi-WAN `failover` and `load_balance` routing modes (supports 2+ interfaces)
 - Continuous ICMP, DNS, and HTTP health probing with weighted scoring
-- Flask API plus React dashboard served from the same process
+- **v2 Industrial UI**: Premium React dashboard with responsive Sidebar/Header layout
+- Real-time charting via Recharts for latency, jitter, and throughput
 - SQLite persistence for metrics, alerts, events, users, and API tokens
 - Hot-reloadable YAML config via `SIGHUP` or API
 - Production deployment assets for `systemd`, `sudoers`, and `logrotate`
@@ -25,21 +26,18 @@ SD-WAN load-balancing controller for Linux multi-WAN systems.
 git clone https://github.com/aditya-tripcuro/SDWANcontrol.git
 cd SDWANcontrol
 sudo ./install.sh
+# Edit interfaces and gateways
 sudo nano /etc/wancontrol/config.yaml
-sudo systemctl start wancontrol
+# Restart to apply changes
+sudo systemctl restart wancontrol
 ```
 
 ## Configuration
 
 Edit `/etc/wancontrol/config.yaml` for interfaces, scoring, server binding, retention, and alerts.
 
-### Generating a secret key
-
-```bash
-python3 -c "import secrets; print(secrets.token_hex(32))"
-```
-
-Paste the result into `server.secret_key`.
+### Secret Key
+The installer automatically generates a cryptographically secure `server.secret_key` in `/etc/wancontrol/config.yaml` on first install. No manual action is required.
 
 ### Interface discovery
 
@@ -117,7 +115,15 @@ This is safe on a non-router machine and does not require root because network s
 
 ## Dashboard
 
-The built frontend is served by Flask from the same HTTP port as the API. Open `http://<host>:5000`, log in, and the dashboard will connect to `/api/stream` for live updates.
+The v2 dashboard is an "Industrial Precision" React application served by Flask. Open `http://<host>:5000` to access the full operations suite:
+
+- **Dashboard**: Live health metrics and active connection tracking.
+- **Metrics**: Detailed historical performance analysis and throughput charts.
+- **Events**: Chronological system logs and audit trails.
+- **Alerts**: Real-time incident management and resolution tracking.
+- **Config**: Responsive management of system and interface settings.
+
+The UI automatically adapts to desktop (Sidebar) and mobile (Bottom Nav) layouts.
 
 ## Updating
 

@@ -1,8 +1,9 @@
-import React, { useEffect } from "react";
-import { Routes, Route, Link } from "react-router-dom";
+import React from "react";
+import { Routes, Route } from "react-router-dom";
 import { AuthProvider } from "./auth/AuthContext";
 import ProtectedRoute from "./auth/ProtectedRoute";
 import { AlertCountProvider } from "./context/AlertCountContext";
+import Layout from "./components/Layout";
 
 import LoginPage from "./pages/LoginPage";
 import DashboardPage from "./pages/DashboardPage";
@@ -20,18 +21,22 @@ const App: React.FC = () => {
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route
-              path="/"
+              path="*"
               element={
                 <ProtectedRoute>
-                  <DashboardPage />
+                  <Layout>
+                    <Routes>
+                      <Route path="/" element={<DashboardPage />} />
+                      <Route path="/metrics" element={<MetricsPage />} />
+                      <Route path="/events" element={<EventsPage />} />
+                      <Route path="/alerts" element={<AlertsPage />} />
+                      <Route path="/users" element={<UsersPage />} />
+                      <Route path="/config" element={<ConfigPage />} />
+                    </Routes>
+                  </Layout>
                 </ProtectedRoute>
               }
             />
-            <Route path="/metrics" element={<ProtectedRoute><MetricsPage /></ProtectedRoute>} />
-            <Route path="/events" element={<ProtectedRoute><EventsPage /></ProtectedRoute>} />
-            <Route path="/alerts" element={<ProtectedRoute><AlertsPage /></ProtectedRoute>} />
-            <Route path="/users" element={<ProtectedRoute><UsersPage /></ProtectedRoute>} />
-            <Route path="/config" element={<ProtectedRoute><ConfigPage /></ProtectedRoute>} />
           </Routes>
         </div>
       </AlertCountProvider>
