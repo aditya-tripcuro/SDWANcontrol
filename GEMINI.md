@@ -1,4 +1,4 @@
-# WANControl v2 - Claude.md
+# WANControl v2 - GEMINI.md
 
 ## Project Overview
 
@@ -527,6 +527,7 @@ When working with this codebase:
 
 ## License
 
+See LICENSE file in repository root.
 
 ---
 
@@ -587,4 +588,3 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
 These guidelines are working if: fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
-
