@@ -32,33 +32,47 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
   ];
 
   return (
-    <div className="flex min-h-screen bg-canvas text-text-strong font-sans">
+    <div className="flex min-h-screen bg-canvas text-on-surface font-sans selection:bg-primary/20">
       {/* Desktop Sidebar */}
-      <aside className="hidden md:flex flex-col w-64 bg-surface border-r border-white/5 fixed inset-y-0">
-        <div className="p-6 flex items-center space-x-3 border-b border-white/5">
-          <div className="w-8 h-8 bg-brand-primary rounded flex items-center justify-center font-bold text-sm">WC</div>
-          <h1 className="font-semibold tracking-tight">WANControl v2</h1>
+      <aside className="hidden md:flex flex-col w-64 bg-surface-dim border-r border-outline-variant/30 fixed inset-y-0">
+        <div className="p-6 flex items-center space-x-3 border-b border-outline-variant/20">
+          <div className="w-10 h-10 bg-primary text-primary-on rounded-lg flex items-center justify-center font-black text-lg shadow-lg shadow-white/5">WC</div>
+          <div className="flex flex-col">
+            <h1 className="font-bold tracking-tight text-text-strong leading-none">WANControl</h1>
+            <span className="text-[10px] text-text-muted font-bold uppercase tracking-[0.2em] mt-1">v2.0 Enterprise</span>
+          </div>
         </div>
-        <nav className="flex-1 p-4 space-y-1">
+        <nav className="flex-1 p-4 space-y-2 mt-4">
           {navItems.map((item) => (
             <Link
               key={item.path}
               to={item.path}
-              className={`flex items-center space-x-3 px-4 py-2.5 rounded-base transition-colors ${
+              className={`flex items-center space-x-3 px-4 py-3 rounded-md transition-all duration-200 group ${
                 location.pathname === item.path
-                  ? "bg-white/10 text-white"
-                  : "text-text-muted hover:bg-white/5 hover:text-white"
+                  ? "bg-surface-bright/20 text-text-strong border border-white/10 shadow-sm"
+                  : "text-text-muted hover:bg-surface-bright/10 hover:text-text-strong border border-transparent"
               }`}
             >
-              {item.icon}
-              <span className="text-sm font-medium">{item.name}</span>
+              <div className={`${location.pathname === item.path ? "text-primary" : "group-hover:text-text-strong"} transition-colors`}>
+                {item.icon}
+              </div>
+              <span className="text-sm font-semibold tracking-wide">{item.name}</span>
+              {location.pathname === item.path && (
+                <div className="ml-auto w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_8px_rgba(255,255,255,0.5)]"></div>
+              )}
             </Link>
           ))}
         </nav>
-        <div className="p-4 border-t border-white/5">
-          <div className="flex items-center space-x-3 px-4 py-2 text-text-muted">
-            <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-            <span className="text-xs font-medium uppercase tracking-wider">System Online</span>
+        <div className="p-6 border-t border-outline-variant/20">
+          <div className="flex items-center space-x-4 p-3 rounded-lg bg-surface-container-low border border-outline-variant/20">
+            <div className="relative">
+              <div className="w-3 h-3 rounded-full bg-success-green shadow-[0_0_8px_rgba(74,222,128,0.5)]"></div>
+              <div className="absolute inset-0 w-3 h-3 rounded-full bg-success-green animate-ping opacity-75"></div>
+            </div>
+            <div className="flex flex-col">
+              <span className="text-[10px] font-black uppercase tracking-widest text-text-strong">Operational</span>
+              <span className="text-[9px] text-text-muted font-medium">Uptime: 14d 6h 22m</span>
+            </div>
           </div>
         </div>
       </aside>
@@ -66,45 +80,56 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
       {/* Main Content Area */}
       <div className="flex-1 md:ml-64 flex flex-col min-h-screen">
         {/* Header */}
-        <header className="h-16 flex items-center justify-between px-6 bg-surface/80 backdrop-blur-md sticky top-0 z-10 border-b border-white/5">
+        <header className="h-16 flex items-center justify-between px-8 bg-canvas/60 backdrop-blur-xl sticky top-0 z-10 border-b border-outline-variant/20">
           <div className="md:hidden flex items-center space-x-3">
-             <div className="w-8 h-8 bg-brand-primary rounded flex items-center justify-center font-bold text-xs">WC</div>
-             <span className="font-semibold text-sm">WANControl</span>
+             <div className="w-8 h-8 bg-primary text-primary-on rounded flex items-center justify-center font-black text-xs">WC</div>
+             <span className="font-bold text-sm tracking-tight">WANControl</span>
           </div>
-          <div className="hidden md:block">
-            <h2 className="text-sm font-medium text-text-muted">
+          <div className="hidden md:flex items-center space-x-2">
+            <span className="text-xs font-bold text-text-muted uppercase tracking-widest">Network Ops</span>
+            <span className="text-text-muted/30">/</span>
+            <h2 className="text-sm font-black text-text-strong uppercase tracking-widest">
               {navItems.find(i => i.path === location.pathname)?.name || "Page"}
             </h2>
           </div>
-          <div className="flex items-center space-x-4">
-             <button className="p-2 text-text-muted hover:text-white transition-colors">
-               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+          <div className="flex items-center space-x-6">
+             <button className="relative p-2 text-text-muted hover:text-text-strong transition-all group">
+               <svg className="w-5 h-5 group-hover:scale-110 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
              </button>
-             <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center overflow-hidden border border-white/10">
-               <span className="text-xs font-bold">AD</span>
+             <div className="h-8 w-px bg-outline-variant/30"></div>
+             <div className="flex items-center space-x-3">
+               <div className="flex flex-col items-end hidden sm:flex">
+                 <span className="text-xs font-bold text-text-strong">Aditya Malpani</span>
+                 <span className="text-[10px] text-primary font-bold uppercase tracking-tighter">System Admin</span>
+               </div>
+               <div className="w-9 h-9 rounded-xl bg-surface-bright border border-outline-variant/40 flex items-center justify-center overflow-hidden shadow-inner group cursor-pointer hover:border-primary/50 transition-colors">
+                 <span className="text-xs font-black group-hover:scale-110 transition-transform">AD</span>
+               </div>
              </div>
           </div>
         </header>
 
         {/* Content */}
-        <main className="flex-1 p-page overflow-x-hidden">
-          {children}
+        <main className="flex-1 p-8 overflow-x-hidden">
+          <div className="max-w-[1600px] mx-auto">
+            {children}
+          </div>
         </main>
 
         {/* Mobile Bottom Nav */}
-        <nav className="md:hidden flex bg-surface border-t border-white/5 fixed bottom-0 inset-x-0 h-16 safe-area-bottom">
+        <nav className="md:hidden flex bg-surface-dim/95 backdrop-blur-lg border-t border-outline-variant/30 fixed bottom-0 inset-x-0 h-16 safe-area-bottom z-50">
           {navItems.map((item) => (
             <Link
               key={item.path}
               to={item.path}
-              className={`flex-1 flex flex-col items-center justify-center space-y-1 transition-colors ${
+              className={`flex-1 flex flex-col items-center justify-center space-y-1 transition-all ${
                 location.pathname === item.path
-                  ? "text-white"
-                  : "text-text-muted hover:text-white"
+                  ? "text-primary"
+                  : "text-text-muted hover:text-text-strong"
               }`}
             >
               {item.icon}
-              <span className="text-[10px] font-medium uppercase tracking-widest">{item.name}</span>
+              <span className="text-[9px] font-black uppercase tracking-widest leading-none">{item.name}</span>
             </Link>
           ))}
         </nav>

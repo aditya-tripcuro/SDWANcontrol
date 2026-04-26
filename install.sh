@@ -23,7 +23,15 @@ if [[ "$EUID" -ne 0 ]]; then
     exit 1
 fi
 
-run apt-get update && run apt-get install -y python3 python3-pip python3-venv iproute2
+run apt-get update && run apt-get install -y python3 python3-pip python3-venv iproute2 nodejs
+
+# Build frontend
+echo "📦 Building frontend assets..."
+if [[ -d "frontend" ]]; then
+    (cd frontend && run npm install && run npm run build)
+else
+    echo "Warning: frontend directory not found, skipping build."
+fi
 
 # create system user
 run bash -c "id -u wancontrol &>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin wancontrol"

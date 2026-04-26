@@ -44,3 +44,28 @@ export async function login(username: string, password: string): Promise<TokenPa
   });
   return res;
 }
+
+export async function getStatus(): Promise<any> {
+  return apiFetch<any>("/api/status");
+}
+
+export async function getMetrics(params?: { interface?: string; limit?: number; since?: number }): Promise<any[]> {
+  const query = new URLSearchParams();
+  if (params?.interface) query.append("interface", params.interface);
+  if (params?.limit) query.append("limit", params.limit.toString());
+  if (params?.since) query.append("since", params.since.toString());
+  const queryString = query.toString();
+  return apiFetch<any[]>(`/api/metrics${queryString ? `?${queryString}` : ""}`);
+}
+
+export async function getAlerts(limit: number = 20): Promise<any[]> {
+  return apiFetch<any[]>(`/api/alerts?limit=${limit}`);
+}
+
+export async function getSwitchEvents(limit: number = 50): Promise<any[]> {
+  return apiFetch<any[]>(`/api/events/switches?limit=${limit}`);
+}
+
+export async function getUsers(): Promise<any[]> {
+  return apiFetch<any[]>("/api/users");
+}
