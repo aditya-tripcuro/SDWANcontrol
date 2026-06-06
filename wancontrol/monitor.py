@@ -11,7 +11,7 @@ Threading is used internally for parallelism within a single call.
 import logging
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, CancelledError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, CancelledError, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -96,6 +96,11 @@ class Monitor:
         self._probe_cfg = probe_cfg
         self._scoring_cfg = scoring_cfg
         self._db = db
+
+    def update_config(self, probe_cfg: ProbeConfig, scoring_cfg: ScoringConfig) -> None:
+        """Replace probe/scoring settings after a config reload."""
+        self._probe_cfg = probe_cfg
+        self._scoring_cfg = scoring_cfg
 
     # ── Public methods ─────────────────────────────────────────────────────
 
@@ -311,6 +316,17 @@ class Monitor:
 
         is_hard_fail = score < self._scoring_cfg.hard_fail_threshold
 
+        # Item 14: when ICMP is fully blocked (loss == 100%) but BOTH app-layer
+        # checks (DNS + HTTP) succeed, the link clearly works and ICMP is simply
+        # filtered — a very common WAN configuration. In that specific case do not
+        # declare a hard failure on the basis of the (meaningless) ICMP signal;
+        # floor the score at the hard-fail threshold so it is at worst DEGRADED.
+        # NB: partial loss (e.g. 50%) is genuine degradation and is left to score
+        # normally, so a truly lossy link can still hard-fail.
+        if probe.icmp_loss_pct >= 100.0 and probe.dns_ok and probe.http_ok and is_hard_fail:
+            score = max(score, self._scoring_cfg.hard_fail_threshold)
+            is_hard_fail = False
+
         return InterfaceMetric(
             interface=probe.interface,
             timestamp=probe.timestamp,
@@ -347,7 +363,7 @@ class Monitor:
             timestamp=ts,
             latency_ms=0.0,
             jitter_ms=0.0,
-            loss_pct=0.0,
+            loss_pct=100.0,
             dns_ok=False,
             http_ok=False,
             score=0.0,
@@ -387,40 +403,47 @@ class Monitor:
         losses: list[float] = []
         targets_ok = 0
 
-        for target in self._probe_cfg.icmp_targets:
-            try:
-                avg_lat, jitter, loss = probe_icmp(
+        max_workers = min(targets_tried, 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    probe_icmp,
                     interface=iface.name,
                     target=target,
                     count=self._probe_cfg.icmp_count,
                     timeout_sec=self._probe_cfg.icmp_timeout_sec,
                 )
+                for target in self._probe_cfg.icmp_targets
+            ]
+            for future in as_completed(futures):
+                try:
+                    avg_lat, jitter, loss = future.result()
+                except Exception:
+                    avg_lat, jitter, loss = 0.0, 0.0, 100.0
                 latencies.append(avg_lat)
                 jitters.append(jitter)
                 losses.append(loss)
                 if loss < 100.0:
                     targets_ok += 1
-            except Exception:
-                # Probe failed completely
-                losses.append(100.0)
-                latencies.append(0.0)
-                jitters.append(0.0)
 
         if targets_ok == 0:
             return (0.0, 0.0, 100.0, targets_tried, 0)
 
-        # Compute averages only over OK targets
+        # Latency/jitter can only be measured on targets that responded, so those
+        # are averaged over OK targets.
         ok_latencies = [
             lat for lat, loss in zip(latencies, losses) if loss < 100.0
         ]
         ok_jitters = [
             jit for jit, loss in zip(jitters, losses) if loss < 100.0
         ]
-        ok_losses = [loss for loss in losses if loss < 100.0]
 
         avg_latency = sum(ok_latencies) / len(ok_latencies) if ok_latencies else 0.0
         avg_jitter = sum(ok_jitters) / len(ok_jitters) if ok_jitters else 0.0
-        avg_loss = sum(ok_losses) / len(ok_losses) if ok_losses else 0.0
+        # Item 15: loss MUST be averaged across ALL targets (a fully-dead target
+        # counts as 100%), otherwise a link that fails most of its probe targets
+        # but answers one would report ~0% loss and mask a partial outage.
+        avg_loss = sum(losses) / len(losses) if losses else 100.0
 
         return (avg_latency, avg_jitter, avg_loss, targets_tried, targets_ok)
 
@@ -450,19 +473,24 @@ class Monitor:
             return (0, total_count)
 
         success_count = 0
-        for target in self._probe_cfg.dns_targets:
-            try:
-                result = probe_dns(
+        max_workers = min(total_count, 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    probe_dns,
                     interface=iface.name,
                     target=target,
                     timeout_sec=self._probe_cfg.dns_timeout_sec,
                     iface_ip=iface_ip,
                 )
-                if result:
-                    success_count += 1
-            except Exception:
-                # Probe failed
-                pass
+                for target in self._probe_cfg.dns_targets
+            ]
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        success_count += 1
+                except Exception:
+                    pass
 
         return (success_count, total_count)
 
@@ -489,19 +517,25 @@ class Monitor:
         success_count = 0
         response_times: list[float] = []
 
-        for target in self._probe_cfg.http_targets:
-            try:
-                success, response_ms = probe_http(
+        max_workers = min(total_count, 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    probe_http,
                     interface=iface.name,
                     target=target,
                     timeout_sec=self._probe_cfg.http_timeout_sec,
                 )
+                for target in self._probe_cfg.http_targets
+            ]
+            for future in as_completed(futures):
+                try:
+                    success, response_ms = future.result()
+                except Exception:
+                    success, response_ms = False, 0.0
                 if success:
                     success_count += 1
                     response_times.append(response_ms)
-            except Exception:
-                # Probe failed
-                pass
 
         avg_response = sum(response_times) / len(response_times) if response_times else 0.0
         return (success_count, total_count, avg_response)

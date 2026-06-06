@@ -1,16 +1,13 @@
 import React, { useState, useEffect } from "react";
 import { getAlerts } from "../api/client";
-import { useAuth } from "../auth/AuthContext";
 
 const AlertsPage: React.FC = () => {
   const [activeTab, setActiveTab] = useState("active");
   const [alerts, setAlerts] = useState<any[]>([]);
-  const auth = useAuth();
 
   useEffect(() => {
-    if (!auth.token) return;
     getAlerts().then(setAlerts).catch(console.error);
-  }, [auth.token]);
+  }, []);
 
   return (
     <div className="space-y-8 pb-12 animate-in fade-in slide-in-from-bottom-4 duration-700">

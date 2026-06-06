@@ -397,14 +397,11 @@ def discover_interfaces() -> list[DiscoveredInterface]:
             skip_reason = "no_gateway"
         elif not is_up:
             skip_reason = "not_up"
+        elif not is_reachable:
+            skip_reason = "not_reachable"
         else:
-            # It's a candidate because it has an IP, Gateway, and is UP.
-            # Reachability is recorded but doesn't disqualify it, as multi-WAN
-            # pings often fail before policy routing is established.
             is_wan_candidate = True
             wan_candidate_count += 1
-            if not is_reachable:
-                skip_reason = "not_reachable (but has gateway)"
 
         # Generate label
         label = f"WAN-{wan_candidate_count} (edit me)" if is_wan_candidate else f"{ifname}"

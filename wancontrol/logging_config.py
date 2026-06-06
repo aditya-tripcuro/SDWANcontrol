@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import logging.config
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -65,14 +64,14 @@ def _default_config(log_level: str, log_file: Path, json_logs: bool) -> dict[str
                 "filters": ["inject_component"],
                 "stream": "ext://sys.stdout",
             },
+            # Plain FileHandler — rotation is owned by logrotate (copytruncate),
+            # so the process must NOT rotate the file itself (audit item 3).
             "file": {
-                "class": "logging.handlers.RotatingFileHandler",
+                "class": "logging.FileHandler",
                 "level": "DEBUG",
                 "formatter": formatter_name,
                 "filters": ["inject_component"],
                 "filename": str(log_file),
-                "maxBytes": 10 * 1024 * 1024,
-                "backupCount": 5,
                 "encoding": "utf-8",
             },
         },
@@ -104,8 +103,19 @@ def _load_yaml_config(log_level: str, log_file: Path, json_logs: bool) -> dict[s
         if "stdout" in handlers:
             handlers["stdout"]["formatter"] = "json" if json_logs else "human"
         if "file" in handlers:
-            handlers["file"]["formatter"] = "json" if json_logs else "human"
-            handlers["file"]["filename"] = str(log_file)
+            file_handler = handlers["file"]
+            file_handler["formatter"] = "json" if json_logs else "human"
+            file_handler["filename"] = str(log_file)
+            # Rotation is owned by logrotate (copytruncate); force a plain
+            # FileHandler even if the YAML still declares a rotating one, and
+            # strip rotation-only keys so dictConfig does not reject it (item 3).
+            if file_handler.get("class") in (
+                "logging.handlers.RotatingFileHandler",
+                "logging.handlers.TimedRotatingFileHandler",
+            ):
+                file_handler["class"] = "logging.FileHandler"
+                for rotation_key in ("maxBytes", "backupCount", "when", "interval", "utc"):
+                    file_handler.pop(rotation_key, None)
 
         root = cfg.setdefault("root", {})
         root["level"] = log_level.upper()
@@ -128,7 +138,12 @@ def setup_logging(
     log_dir: str | Path,
     json_logs: bool = False,
 ) -> None:
-    """Configure stdout + rotating-file logging for WANControl."""
+    """Configure stdout + plain file logging for WANControl.
+
+    The file handler is a plain ``logging.FileHandler``; log rotation is owned
+    externally by logrotate using ``copytruncate`` (audit item 3), so the
+    process never rotates or reopens the log file itself.
+    """
     log_dir_path = Path(log_dir)
     log_dir_path.mkdir(parents=True, exist_ok=True)
     log_file = log_dir_path / "wancontrol.log"
@@ -142,8 +157,13 @@ def setup_logging(
         config = None
 
     if config is not None:
-        logging.config.dictConfig(config)
-    else:
+        try:
+            logging.config.dictConfig(config)
+        except Exception as exc:
+            print(f"CRITICAL: Failed to configure logging from dict: {exc}. Falling back to default stdout logging.")
+            config = None  # Force fallback
+
+    if config is None:
         root = logging.getLogger()
         root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
@@ -158,10 +178,9 @@ def setup_logging(
         stdout_handler.setFormatter(formatter)
         stdout_handler.addFilter(inject_component)
 
-        file_handler = RotatingFileHandler(
+        # Plain FileHandler — logrotate (copytruncate) owns rotation (item 3).
+        file_handler = logging.FileHandler(
             log_file,
-            maxBytes=10 * 1024 * 1024,
-            backupCount=5,
             encoding="utf-8",
         )
         file_handler.setLevel(logging.DEBUG)

@@ -130,9 +130,9 @@ def lb_ctrl(lb_cfg, lb_db) -> Controller:
 
 class TestStopIntegration:
     @mock.patch("wancontrol.network.set_default_route")
-    def test_stop_persists_killed_mode_to_file_db(self, _mock, ctrl, file_db):
+    def test_stop_persists_stopped_mode_to_file_db(self, _mock, ctrl, file_db):
         ctrl.stop()
-        assert file_db.get_state("controller_mode") == "KILLED"
+        assert file_db.get_state("controller_mode") == "STOPPED"
 
     @mock.patch("wancontrol.network.set_default_route")
     def test_stop_logs_shutdown_event_to_file_db(self, _mock, ctrl, file_db):
@@ -141,9 +141,9 @@ class TestStopIntegration:
         assert any("shutdown" in e.message.lower() for e in events)
 
     @mock.patch("wancontrol.network.set_default_route")
-    def test_get_status_after_stop_returns_killed(self, _mock, ctrl):
+    def test_get_status_after_stop_returns_stopped(self, _mock, ctrl):
         ctrl.stop()
-        assert ctrl.get_status()["mode"] == "KILLED"
+        assert ctrl.get_status()["mode"] == "STOPPED"
 
     @mock.patch("wancontrol.network.set_default_route")
     def test_stop_can_be_called_multiple_times_without_error(self, _mock, ctrl):
@@ -166,15 +166,19 @@ class TestStateMachineIntegration:
         ctrl._update_wan_state(s, _metric(score=50.0))
         assert s.wan_state == WanState.DEGRADED
 
-        # DEGRADED → FAILED
-        ctrl._update_wan_state(s, _metric(score=0.0, is_hard_fail=True))
+        # DEGRADED → FAILED only after fail_confirmations (item 11, default 3)
+        # consecutive hard-fail cycles; a single bad sample holds in DEGRADED.
+        for _ in range(3):
+            ctrl._update_wan_state(s, _metric(score=0.0, is_hard_fail=True))
         assert s.wan_state == WanState.FAILED
 
-        # FAILED → DEGRADED (score=30 >= hard_fail_threshold=20)
+        # FAILED → DEGRADED (score=30 >= hard_fail_threshold=20, not yet a full
+        # recover_confirmations streak)
         ctrl._update_wan_state(s, _metric(score=30.0, is_hard_fail=False))
         assert s.wan_state == WanState.DEGRADED
 
-        # DEGRADED → STABLE (score=95 >= degraded_threshold=55)
+        # DEGRADED → STABLE (score=95 >= degraded_threshold=55) — DEGRADED→STABLE
+        # is instantaneous; only FAILED recovery is debounced.
         ctrl._update_wan_state(s, _metric(score=95.0, is_hard_fail=False))
         assert s.wan_state == WanState.STABLE
 
@@ -183,7 +187,10 @@ class TestStateMachineIntegration:
         s0 = ctrl._interface_states["wan0"]
         s1 = ctrl._interface_states["wan1"]
 
-        ctrl._update_wan_state(s0, _metric("wan0", score=0.0, is_hard_fail=True))
+        # wan0 needs fail_confirmations (item 11, default 3) consecutive
+        # hard-fail cycles before it is declared FAILED.
+        for _ in range(3):
+            ctrl._update_wan_state(s0, _metric("wan0", score=0.0, is_hard_fail=True))
         ctrl._update_wan_state(s1, _metric("wan1", score=95.0))
 
         assert s0.wan_state == WanState.FAILED
@@ -307,7 +314,7 @@ class TestWatchdogIntegration:
         wd = Watchdog(cfg=app_cfg, db=file_db, controller=ctrl)
         with mock.patch("signal.signal"):
             wd.start()
-        # Stop controller — should persist KILLED and log event
+        # Stop controller — should persist STOPPED and log event
         ctrl.stop()
-        assert file_db.get_state("controller_mode") == "KILLED"
+        assert file_db.get_state("controller_mode") == "STOPPED"
         wd.stop()

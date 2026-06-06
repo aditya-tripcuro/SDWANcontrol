@@ -1,91 +1,206 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
+import { getSwitchEvents, getControllerEvents } from "../api/client";
+import { useTimezone } from "../context/TimezoneContext";
+
+const LEVEL_STYLES: Record<string, string> = {
+  ERROR:    "bg-error-red/10 text-error-red border-error-red/20",
+  WARNING:  "bg-warning-amber/10 text-warning-amber border-warning-amber/20",
+  INFO:     "bg-sky-500/10 text-sky-400 border-sky-500/20",
+  DEBUG:    "bg-surface-bright/50 text-text-muted border-outline-variant/20",
+  CRITICAL: "bg-error-red/20 text-error-red border-error-red/40",
+};
 
 const EventsPage: React.FC = () => {
-  const [filter, setFilter] = useState("all");
+  const [activeTab, setActiveTab] = useState<"controller" | "switches">("controller");
+  const [filter, setFilter] = useState("ALL");
+  const [controllerEvents, setControllerEvents] = useState<any[]>([]);
+  const [switchEvents, setSwitchEvents] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const { formatTs } = useTimezone();
 
-  const events = [
-    { id: 1, time: "2026-04-24 19:45:12", type: "system", message: "Interface WAN1 switched to eth0 (Fiber)", severity: "info" },
-    { id: 2, time: "2026-04-24 19:40:05", type: "network", message: "Latency spike detected on eth1 (LTE): 450ms", severity: "warning" },
-    { id: 3, time: "2026-04-24 19:35:00", type: "auth", message: "Successful login from admin (192.168.1.50)", severity: "info" },
-    { id: 4, time: "2026-04-24 19:30:22", type: "system", message: "Core controller service restarted", severity: "success" },
-    { id: 5, time: "2026-04-24 19:25:10", type: "network", message: "VPN Tunnel 'Office-Primary' disconnected", severity: "error" },
-    { id: 6, time: "2026-04-24 19:20:00", type: "system", message: "New firmware update available: v2.1.4", severity: "info" },
-  ];
+  useEffect(() => {
+    setLoading(true);
+    Promise.all([
+      getControllerEvents(200).catch(() => []),
+      getSwitchEvents(100).catch(() => []),
+    ]).then(([ctrl, sw]) => {
+      setControllerEvents(ctrl);
+      setSwitchEvents(sw);
+      setLoading(false);
+    });
+  }, []);
 
-  const getSeverityStyles = (severity: string) => {
-    switch (severity) {
-      case "error": return "bg-red-500/10 text-red-400 border-red-500/20";
-      case "warning": return "bg-yellow-500/10 text-yellow-400 border-yellow-500/20";
-      case "success": return "bg-emerald-500/10 text-emerald-400 border-emerald-500/20";
-      default: return "bg-sky-500/10 text-sky-400 border-sky-500/20";
-    }
-  };
+  const filteredCtrl = controllerEvents.filter(
+    (e) => filter === "ALL" || e.level === filter
+  );
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 pb-12 animate-in fade-in slide-in-from-bottom-4 duration-700">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold text-text-strong">System Events</h2>
-          <p className="text-sm text-text-muted">Audit logs and network state transitions</p>
+          <h2 className="text-xl font-black text-text-strong tracking-tight uppercase">System Events</h2>
+          <p className="text-sm text-text-muted font-medium mt-1">
+            Audit logs and WAN switching history
+          </p>
         </div>
-        <div className="flex items-center space-x-2 bg-surface p-1 rounded-sm border border-white/5">
-           {["all", "info", "warning", "error"].map((f) => (
-             <button
-               key={f}
-               onClick={() => setFilter(f)}
-               className={`px-3 py-1 text-[10px] font-bold uppercase tracking-widest rounded-sm transition-all ${
-                 filter === f ? "bg-brand-primary text-white" : "text-text-muted hover:text-white"
-               }`}
-             >
-               {f}
-             </button>
-           ))}
+
+        {/* Tab toggle */}
+        <div className="flex items-center space-x-2 bg-surface-bright/20 p-1 rounded-xl border border-outline-variant/20">
+          <button
+            onClick={() => setActiveTab("controller")}
+            className={`px-5 py-2 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all ${
+              activeTab === "controller"
+                ? "bg-primary text-primary-on shadow-lg"
+                : "text-text-muted hover:text-text-strong"
+            }`}
+          >
+            Controller Logs
+          </button>
+          <button
+            onClick={() => setActiveTab("switches")}
+            className={`px-5 py-2 text-[10px] font-black uppercase tracking-widest rounded-lg transition-all ${
+              activeTab === "switches"
+                ? "bg-primary text-primary-on shadow-lg"
+                : "text-text-muted hover:text-text-strong"
+            }`}
+          >
+            WAN Switches
+          </button>
         </div>
       </div>
 
-      <div className="bg-surface rounded-base border border-white/5 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left">
-            <thead>
-              <tr className="bg-white/5">
-                <th className="px-6 py-3 text-[10px] font-bold text-text-muted uppercase tracking-widest">Timestamp</th>
-                <th className="px-6 py-3 text-[10px] font-bold text-text-muted uppercase tracking-widest">Type</th>
-                <th className="px-6 py-3 text-[10px] font-bold text-text-muted uppercase tracking-widest">Message</th>
-                <th className="px-6 py-3 text-[10px] font-bold text-text-muted uppercase tracking-widest text-right">Severity</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-white/5">
-              {events
-                .filter(e => filter === "all" || e.severity === filter)
-                .map((event) => (
-                <tr key={event.id} className="hover:bg-white/[0.02] transition-colors group">
-                  <td className="px-6 py-4 text-xs font-mono text-text-muted">{event.time}</td>
-                  <td className="px-6 py-4 text-xs">
-                    <span className="text-text-strong font-medium uppercase tracking-tighter text-[10px]">{event.type}</span>
-                  </td>
-                  <td className="px-6 py-4 text-xs text-text-strong">{event.message}</td>
-                  <td className="px-6 py-4 text-right">
-                    <span className={`inline-block px-2 py-0.5 rounded-sm text-[9px] font-black uppercase border ${getSeverityStyles(event.severity)}`}>
-                      {event.severity}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      {/* Level filter — only for controller tab */}
+      {activeTab === "controller" && (
+        <div className="flex items-center space-x-2 bg-canvas/30 p-1 rounded-xl border border-outline-variant/20 w-fit">
+          {["ALL", "INFO", "WARNING", "ERROR", "CRITICAL", "DEBUG"].map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`px-4 py-1.5 text-[9px] font-black uppercase tracking-widest rounded-lg transition-all ${
+                filter === f
+                  ? "bg-surface-bright text-text-strong shadow-sm"
+                  : "text-text-muted hover:text-text-strong"
+              }`}
+            >
+              {f}
+            </button>
+          ))}
         </div>
-        <div className="px-6 py-4 bg-white/5 border-t border-white/5 flex items-center justify-between">
-          <span className="text-[10px] text-text-muted uppercase font-bold tracking-widest">Showing 6 of 1,245 events</span>
-          <div className="flex space-x-2">
-             <button className="p-1 text-text-muted hover:text-white transition-colors">
-               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
-             </button>
-             <button className="p-1 text-text-muted hover:text-white transition-colors">
-               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
-             </button>
+      )}
+
+      {loading ? (
+        <div className="py-24 text-center text-text-muted text-xs font-black uppercase tracking-widest">
+          Loading events…
+        </div>
+      ) : activeTab === "controller" ? (
+        /* Controller Events */
+        <div className="bg-surface-container-low rounded-2xl border border-outline-variant/20 shadow-sm overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr className="bg-canvas/20">
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Time</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Level</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Component</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Message</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-outline-variant/10 font-mono text-xs">
+                {filteredCtrl.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="px-6 py-16 text-center text-text-muted font-sans font-bold uppercase tracking-widest">
+                      No events found
+                    </td>
+                  </tr>
+                ) : (
+                  filteredCtrl.map((ev) => (
+                    <tr key={ev.id} className="hover:bg-primary/[0.01] transition-colors group">
+                      <td className="px-6 py-3 text-text-muted whitespace-nowrap">
+                        {formatTs(ev.timestamp, {
+                          month: "2-digit",
+                          day: "2-digit",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          second: "2-digit",
+                          hour12: false,
+                        })}
+                      </td>
+                      <td className="px-6 py-3">
+                        <span
+                          className={`inline-flex px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-widest border font-sans ${
+                            LEVEL_STYLES[ev.level] ?? LEVEL_STYLES.INFO
+                          }`}
+                        >
+                          {ev.level}
+                        </span>
+                      </td>
+                      <td className="px-6 py-3 text-text-muted">{ev.component}</td>
+                      <td className="px-6 py-3 text-text-strong">{ev.message}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
-      </div>
+      ) : (
+        /* Switch Events */
+        <div className="bg-surface-container-low rounded-2xl border border-outline-variant/20 shadow-sm overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr className="bg-canvas/20">
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Time</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">From</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">To</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Reason</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em] text-right">Score Before</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em] text-right">Score After</th>
+                  <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Triggered By</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-outline-variant/10 text-xs">
+                {switchEvents.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-6 py-16 text-center text-text-muted font-bold uppercase tracking-widest">
+                      No WAN switches recorded yet
+                    </td>
+                  </tr>
+                ) : (
+                  switchEvents.map((ev) => (
+                    <tr key={ev.id} className="hover:bg-primary/[0.01] transition-colors group">
+                      <td className="px-6 py-4 text-text-muted font-mono whitespace-nowrap">
+                        {formatTs(ev.timestamp, {
+                          month: "2-digit",
+                          day: "2-digit",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                          second: "2-digit",
+                          hour12: false,
+                        })}
+                      </td>
+                      <td className="px-6 py-4">
+                        <span className="px-2 py-1 rounded bg-error-red/10 text-error-red text-[9px] font-black uppercase tracking-widest border border-error-red/20 font-sans">
+                          {ev.from_interface}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4">
+                        <span className="px-2 py-1 rounded bg-success-green/10 text-success-green text-[9px] font-black uppercase tracking-widest border border-success-green/20 font-sans">
+                          {ev.to_interface}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4 text-text-muted">{ev.reason}</td>
+                      <td className="px-6 py-4 text-right font-mono font-black text-text-muted">{ev.score_before?.toFixed(1)}</td>
+                      <td className="px-6 py-4 text-right font-mono font-black text-text-strong">{ev.score_after?.toFixed(1)}</td>
+                      <td className="px-6 py-4 text-text-muted">{ev.triggered_by}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

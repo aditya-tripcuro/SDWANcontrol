@@ -5,7 +5,7 @@ const UsersPage: React.FC = () => {
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
       <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-black text-text-strong tracking-tight">Identity & Access</h1>
+          <h1 className="text-2xl font-black text-text-strong tracking-tight">Users</h1>
           <p className="text-text-muted text-sm mt-1 font-medium">Manage node administrators and terminal access tokens</p>
         </div>
         <button className="px-6 py-3 bg-primary text-primary-on rounded-xl text-[10px] font-black uppercase tracking-[0.2em] hover:scale-105 transition-all shadow-xl shadow-white/5">Provision Admin</button>

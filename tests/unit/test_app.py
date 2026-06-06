@@ -395,7 +395,7 @@ def test_config_reload_as_operator_returns_200(seeded_client, operator_token):
 
 def test_db_stats_as_admin_returns_200(seeded_client, admin_token):
     r = seeded_client.get("/api/db/stats", headers=auth_headers(admin_token))
-    assert r.status_code == 200 and r.get_json().get("schema_version") == 1
+    assert r.status_code == 200 and r.get_json().get("schema_version") == 2
 
 
 def test_nonexistent_route_returns_404_json_with_error_key(client):
@@ -948,7 +948,7 @@ def test_config_reload(client: Any) -> None:
 def test_db_stats_schema_version(client: Any) -> None:
     resp = client.get("/api/db/stats", headers=admin_hdrs(client))
     assert resp.status_code == 200
-    assert resp.get_json()["schema_version"] == 1
+    assert resp.get_json()["schema_version"] == 2
 
 
 def test_db_prune(client: Any) -> None:
@@ -990,3 +990,41 @@ def test_users_list_no_password_hash_in_body(client: Any) -> None:
     resp = client.get("/api/users", headers=admin_hdrs(client))
     assert resp.status_code == 200
     assert "password_hash" not in resp.get_data(as_text=True)
+
+
+# ── SSE TICKET AUTH (review fix: EventSource can't send headers) ────────────────
+# NOTE: we never GET /api/stream with a VALID ticket — that opens the infinite
+# event generator and would hang the test client. We only assert the auth gating.
+
+def test_stream_ticket_requires_auth(client: Any) -> None:
+    resp = client.post("/api/stream/ticket")
+    assert resp.status_code == 401
+
+
+def test_stream_ticket_issued_with_auth(client: Any) -> None:
+    resp = client.post("/api/stream/ticket", headers=viewer_hdrs(client))
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body.get("ticket")
+    assert body.get("expires_in") == 30
+
+
+def test_stream_rejects_unauthenticated_request(client: Any) -> None:
+    # No header, no ticket: a browser EventSource hitting /api/stream is refused.
+    resp = client.get("/api/stream")
+    assert resp.status_code == 401
+
+
+def test_stream_rejects_bogus_ticket(client: Any) -> None:
+    resp = client.get("/api/stream?ticket=not-a-real-ticket")
+    assert resp.status_code == 401
+
+
+def test_stream_ticket_is_single_use(client: Any) -> None:
+    # Issue a ticket, then prove the SAME ticket value can't be replayed by
+    # consuming it directly from the store (a successful GET would hang the
+    # client on the SSE generator, so we assert at the store layer).
+    issued = client.post("/api/stream/ticket", headers=viewer_hdrs(client)).get_json()["ticket"]
+    store = client.application.config["STREAM_TICKETS"]
+    assert store.consume(issued, now=time.time()) is not None   # first use ok
+    assert store.consume(issued, now=time.time()) is None        # replay refused

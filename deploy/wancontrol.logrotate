@@ -5,10 +5,6 @@
     compress
     delaycompress
     notifempty
+    copytruncate
     create 0640 wancontrol wancontrol
-    sharedscripts
-    postrotate
-        # Signal the process to reopen log files
-        systemctl kill --kill-who=main --signal=USR1 wancontrol.service 2>/dev/null || true
-    endscript
 }

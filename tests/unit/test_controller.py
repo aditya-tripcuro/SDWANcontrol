@@ -151,8 +151,10 @@ class TestControllerInit:
     def test_load_balance_mode_populates_nexthop_pool(self, lb_ctrl):
         assert set(lb_ctrl._nexthop_pool) == {"wan0", "wan1"}
 
-    def test_mode_starts_as_starting(self, ctrl):
-        assert ctrl._mode == ControllerMode.STARTING
+    def test_mode_starts_as_stopped(self, ctrl):
+        # A freshly-constructed, not-yet-started controller is STOPPED (it may
+        # never start when auto_start is off), matching the DB state __main__ sets.
+        assert ctrl._mode == ControllerMode.STOPPED
 
     def test_interface_states_created_for_all_interfaces(self, ctrl):
         assert "wan0" in ctrl._interface_states
@@ -177,7 +179,7 @@ class TestGetStatus:
             assert key in s
 
     def test_mode_reflects_current_controller_mode(self, ctrl):
-        assert ctrl.get_status()["mode"] == "STARTING"
+        assert ctrl.get_status()["mode"] == "STOPPED"
 
     def test_wan_mode_is_correct(self, ctrl, lb_ctrl):
         assert ctrl.get_status()["wan_mode"] == "failover"
@@ -244,8 +246,14 @@ class TestWanStateMachine:
 
     # STABLE transitions
     def test_stable_to_failed_on_hard_fail(self, ctrl):
+        # Anti-flap (item 11): a single hard-fail sample holds in DEGRADED; the
+        # link only becomes FAILED after `fail_confirmations` consecutive
+        # hard-fail cycles (default 3).
         s = self._state(ctrl, WanState.STABLE, 95.0)
         ctrl._update_wan_state(s, _metric(score=0.0, is_hard_fail=True))
+        assert s.wan_state == WanState.DEGRADED
+        for _ in range(2):
+            ctrl._update_wan_state(s, _metric(score=0.0, is_hard_fail=True))
         assert s.wan_state == WanState.FAILED
 
     def test_stable_to_degraded_when_score_below_threshold(self, ctrl):
@@ -268,8 +276,11 @@ class TestWanStateMachine:
 
     # DEGRADED transitions
     def test_degraded_to_failed_on_hard_fail(self, ctrl):
+        # Anti-flap (item 11): FAILED only after `fail_confirmations` (default 3)
+        # consecutive hard-fail cycles.
         s = self._state(ctrl, WanState.DEGRADED, 50.0)
-        ctrl._update_wan_state(s, _metric(score=0.0, is_hard_fail=True))
+        for _ in range(3):
+            ctrl._update_wan_state(s, _metric(score=0.0, is_hard_fail=True))
         assert s.wan_state == WanState.FAILED
 
     def test_degraded_to_stable_when_score_recovers(self, ctrl):
@@ -302,22 +313,6 @@ class TestWanStateMachine:
         ctrl._update_wan_state(s, _metric(score=5.0, is_hard_fail=False))
         assert s.wan_state == WanState.FAILED
 
-    # SWITCHING transitions
-    def test_switching_to_stable_on_good_score(self, ctrl):
-        s = self._state(ctrl, WanState.SWITCHING, 95.0)
-        ctrl._update_wan_state(s, _metric(score=95.0, is_hard_fail=False))
-        assert s.wan_state == WanState.STABLE
-
-    def test_switching_stays_switching_on_hard_fail(self, ctrl):
-        s = self._state(ctrl, WanState.SWITCHING, 0.0)
-        ctrl._update_wan_state(s, _metric(score=0.0, is_hard_fail=True))
-        assert s.wan_state == WanState.SWITCHING
-
-    def test_switching_stays_switching_on_low_score(self, ctrl):
-        s = self._state(ctrl, WanState.SWITCHING, 0.0)
-        ctrl._update_wan_state(s, _metric(score=5.0, is_hard_fail=False))
-        assert s.wan_state == WanState.SWITCHING
-
     # stable_since reset
     def test_stable_since_reset_when_entering_stable(self, ctrl):
         s = self._state(ctrl, WanState.DEGRADED, 50.0)
@@ -339,19 +334,26 @@ class TestWanStateMachine:
 
 class TestStop:
     @mock.patch("wancontrol.network.set_default_route")
-    def test_mode_set_to_killed(self, _mock_route, ctrl):
+    def test_stop_sets_mode_to_stopped(self, _mock_route, ctrl):
+        # Graceful stop() ends in STOPPED (distinct from kill() -> KILLED).
         ctrl.stop()
+        assert ctrl._mode == ControllerMode.STOPPED
+
+    @mock.patch("wancontrol.network.set_default_route")
+    def test_kill_sets_mode_to_killed(self, _mock_route, ctrl):
+        # Emergency kill() ends in KILLED.
+        ctrl.kill()
         assert ctrl._mode == ControllerMode.KILLED
 
     @mock.patch("wancontrol.network.set_default_route")
-    def test_killed_persisted_to_db(self, _mock_route, ctrl, mem_db):
+    def test_stopped_persisted_to_db(self, _mock_route, ctrl, mem_db):
         ctrl.stop()
-        assert mem_db.get_state("controller_mode") == "KILLED"
+        assert mem_db.get_state("controller_mode") == "STOPPED"
 
     @mock.patch("wancontrol.network.set_default_route")
-    def test_get_status_returns_killed_after_stop(self, _mock_route, ctrl):
+    def test_get_status_returns_stopped_after_stop(self, _mock_route, ctrl):
         ctrl.stop()
-        assert ctrl.get_status()["mode"] == "KILLED"
+        assert ctrl.get_status()["mode"] == "STOPPED"
 
     @mock.patch("wancontrol.network.set_default_route")
     def test_shutdown_event_logged_to_db(self, _mock_route, ctrl, mem_db):
@@ -359,11 +361,16 @@ class TestStop:
         events = mem_db.get_events()
         assert any("shutdown" in e.message.lower() for e in events)
 
-    @mock.patch("wancontrol.controller.set_default_route")
-    def test_default_route_restored_to_primary(self, mock_route, ctrl, app_cfg):
-        ctrl.stop()
-        primary = app_cfg.interfaces[0]
-        mock_route.assert_called_once_with(primary.gateway, primary.name)
+    def test_stop_restores_routes_via_snapshot(self, ctrl, app_cfg):
+        # Route-restore fix (plan items 5-9): shutdown no longer hardcodes a
+        # `set_default_route(primary.gateway, primary.name)`. It tears down the
+        # managed interfaces and restores the ORIGINAL default-route snapshot via
+        # network.emergency_cleanup -> restore_default_routes, so multipath /
+        # multiple-default / metric-preserving restores all work and a stale
+        # "primary" assumption can't clobber the real saved route.
+        with mock.patch("wancontrol.network.emergency_cleanup") as mock_cleanup:
+            ctrl.stop()
+        mock_cleanup.assert_called_once_with(app_cfg.interfaces, ctrl._db)
 
 
 # ── Controller: _apply_load_balance() ─────────────────────────────────────────

@@ -65,15 +65,16 @@ class TestSetup:
         expected = {
             "schema_version", "metrics", "switch_events",
             "controller_events", "state", "users", "api_tokens", "alerts",
+            "intended_routes",
         }
         assert expected.issubset(tables)
 
     def test_initialize_is_idempotent(self, file_db: Database) -> None:
         file_db.initialize()  # second call — must not raise
 
-    def test_schema_version_is_1_after_initialize(self, mem_db: Database) -> None:
+    def test_schema_version_after_initialize(self, mem_db: Database) -> None:
         stats = mem_db.get_db_stats()
-        assert stats.schema_version == 1
+        assert stats.schema_version == 2
 
     def test_wal_mode_enabled(self, file_db: Database) -> None:
         conn = sqlite3.connect(str(file_db._path))
@@ -491,8 +492,8 @@ class TestStats:
         assert stats.alerts_count == 1
         assert stats.users_count == 1
 
-    def test_get_db_stats_schema_version_is_1(self, mem_db: Database) -> None:
-        assert mem_db.get_db_stats().schema_version == 1
+    def test_get_db_stats_schema_version(self, mem_db: Database) -> None:
+        assert mem_db.get_db_stats().schema_version == 2
 
     def test_get_db_stats_file_size_bytes_positive(self, file_db: Database) -> None:
         file_db.insert_metric("wan0", 10.0, 1.0, 0.0, True, True, 90.0)
@@ -520,8 +521,9 @@ class TestMigrations:
         rows = conn.execute("SELECT version FROM schema_version").fetchall()
         conn.close()
         versions = [r[0] for r in rows]
-        # Exactly one row for version 1
+        # Exactly one row per applied migration (versions 1 and 2)
         assert versions.count(1) == 1
+        assert versions.count(2) == 1
 
 
 # ── THREAD SAFETY ─────────────────────────────────────────────────────────────

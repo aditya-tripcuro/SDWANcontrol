@@ -1,14 +1,17 @@
 import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 
 const LoginPage: React.FC = () => {
   const auth = useAuth();
   const nav = useNavigate();
+  const location = useLocation();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  
+  const successMessage = location.state?.message;
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -44,6 +47,13 @@ const LoginPage: React.FC = () => {
         </div>
 
         <form onSubmit={submit} className="bg-surface-container-low p-10 rounded-3xl border border-outline-variant/20 shadow-2xl space-y-8 backdrop-blur-md">
+          {successMessage && (
+            <div className="bg-success-green/10 border border-success-green/20 p-4 rounded-xl flex items-start space-x-3 animate-in fade-in zoom-in duration-300">
+              <svg className="w-4 h-4 text-success-green mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+              <span className="text-[11px] font-bold text-success-green">{successMessage}</span>
+            </div>
+          )}
+
           {error && (
             <div className="bg-error-red/10 border border-error-red/20 p-4 rounded-xl flex items-start space-x-3 animate-in fade-in zoom-in duration-300">
               <svg className="w-4 h-4 text-error-red mt-0.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -53,9 +63,10 @@ const LoginPage: React.FC = () => {
 
           <div className="space-y-6">
             <div className="space-y-2.5 group">
-              <label className="text-[10px] font-black text-text-muted group-focus-within:text-primary uppercase tracking-[0.2em] transition-colors">Infrastructure Identity</label>
+              <label htmlFor="username" className="text-[10px] font-black text-text-muted group-focus-within:text-primary uppercase tracking-[0.2em] transition-colors">Username</label>
               <div className="relative">
                 <input 
+                  id="username"
                   value={username} 
                   onChange={(e)=>setUsername(e.target.value)} 
                   className="w-full bg-canvas/50 border border-outline-variant/30 rounded-xl px-5 py-4 text-sm text-text-strong focus:outline-none focus:border-primary/50 focus:ring-4 focus:ring-primary/5 transition-all placeholder:text-text-muted/30"
@@ -64,9 +75,10 @@ const LoginPage: React.FC = () => {
               </div>
             </div>
             <div className="space-y-2.5 group">
-              <label className="text-[10px] font-black text-text-muted group-focus-within:text-primary uppercase tracking-[0.2em] transition-colors">Access Token / PWD</label>
+              <label htmlFor="password" className="text-[10px] font-black text-text-muted group-focus-within:text-primary uppercase tracking-[0.2em] transition-colors">Password</label>
               <div className="relative">
                 <input 
+                  id="password"
                   type="password" 
                   value={password} 
                   onChange={(e)=>setPassword(e.target.value)} 
@@ -82,7 +94,7 @@ const LoginPage: React.FC = () => {
             className={`w-full bg-primary text-primary-on py-4 rounded-xl text-[11px] font-black uppercase tracking-[0.3em] hover:scale-[1.02] active:scale-[0.98] transition-all shadow-xl shadow-white/5 relative overflow-hidden group ${loading ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
             <div className="absolute inset-0 bg-white/10 translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-1000"></div>
-            <span className="relative z-10">{loading ? "Synchronizing..." : "Initiate Protocol"}</span>
+            <span className="relative z-10">{loading ? "Synchronizing..." : "Sign in"}</span>
           </button>
         </form>
 

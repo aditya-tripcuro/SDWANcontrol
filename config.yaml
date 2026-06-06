@@ -60,9 +60,22 @@ scoring:
   # Interface is removed from nexthop set when score < hard_fail_threshold
   # and re-added when score recovers above hard_fail_threshold + recovery_margin
   recovery_margin: 10
+  # ── Anti-flap (items 11/16) ──
+  # A link is only declared FAILED after this many consecutive hard-fail cycles,
+  # and only declared recovered after this many consecutive healthy cycles.
+  # Guards against false readings / short drops causing route thrash.
+  fail_confirmations: 3
+  recover_confirmations: 5
+  # Never switch the active route more than once within this many seconds.
+  min_switch_interval_sec: 60
+  # In failover mode, a recovered primary must stay healthy this long before we
+  # return to it (dwell). Replaces the previously hardcoded 30s.
+  return_stability_sec: 30
 
 # ── Controller ────────────────────────────────────────────────────────────────
 controller:
+  # Safe default for remote servers: observe only until Start is pressed/API-called.
+  auto_start: false
   loop_interval_sec: 1
   benchmark_interval_sec: 300
   metric_collection_timeout_sec: 8
@@ -93,8 +106,20 @@ alerting:
 
 # ── Web Server ────────────────────────────────────────────────────────────────
 server:
+  # Listen on LAN and VPN interfaces. Keep this host behind a firewall/router:
+  # allow TCP/23232 only from your private LAN and Tailscale ranges.
   host: "0.0.0.0"
-  port: 5000
+  port: 23232
+  # Keep this true for any shared/private LAN or VPN-exposed deployment.
+  # Only set false for strictly localhost/SSH-tunnel-only access.
+  auth_enabled: true
+  # Optional IP allow-list. If non-empty, requests whose source address is not
+  # inside one of these CIDRs are rejected before auth. Empty = allow any source
+  # (auth still applies). The Tailscale CGNAT range (100.64.0.0/10) is shown as
+  # an example; add your private LAN range(s) too if you reach the UI over LAN.
+  allowed_cidrs: []
+    # - "100.64.0.0/10"   # Tailscale tailnet
+    # - "192.168.0.0/16"  # private LAN
   # Recommended: set WANCONTROL_SECRET_KEY via .env and keep this as a placeholder.
   # Generate a real key: python3 -c "import secrets; print(secrets.token_hex(32))"
   secret_key: "REPLACE_ME_run_python_secrets_token_hex_32"
@@ -102,7 +127,7 @@ server:
   session_timeout_minutes: 60
 
 # ── File Paths ────────────────────────────────────────────────────────────────
-lock_file: "./controller.lock"
-heartbeat_file: "./controller.heartbeat"
-db_path: "./wan.db"
-log_dir: "./logs"
+lock_file: "/run/wancontrol/controller.lock"
+heartbeat_file: "/run/wancontrol/controller.heartbeat"
+db_path: "/var/lib/wancontrol/wan.db"
+log_dir: "/var/lib/wancontrol/logs"

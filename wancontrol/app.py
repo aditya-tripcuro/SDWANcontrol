@@ -1,20 +1,23 @@
 """
 wancontrol/app.py
 ~~~~~~~~~~~~~~~~~
-Flask REST API layer for WANControl v2 (Phase 6).
+Flask REST API layer for WANControl v2.
 
 All endpoints are under /api and return application/json.
-Authentication via ``Authorization: Bearer <jwt>`` or ``X-API-Token: <raw>``.
+No authentication — designed for trusted local network use.
 Unix timestamps are returned as floats.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
+import ipaddress
 import logging
+import secrets
+import threading
 import time
 import traceback
-from functools import wraps
 from typing import TYPE_CHECKING, Any
 import json as _json
 from pathlib import Path
@@ -24,8 +27,8 @@ from flask import (
     Blueprint,
     Flask,
     Response,
+    abort,
     current_app,
-    g,
     jsonify,
     request,
     stream_with_context,
@@ -34,22 +37,214 @@ from flask import (
 
 from wancontrol import __version__
 from wancontrol.auth import Auth, AuthError, UserPrincipal
-from wancontrol.config import AppConfig, Config, ConfigError, _parse_interfaces
-from wancontrol.database import ApiTokenRow, Database, MetricRow, UserRow
+from wancontrol.config import AppConfig, Config, ConfigError, VALID_WAN_MODES, _parse_interfaces
+from wancontrol.database import Database, MetricRow, UserRow
+from wancontrol.network_discovery import DiscoveredInterface, discover_interfaces, generate_config_fragment_dict
 
 if TYPE_CHECKING:
     from wancontrol.controller import Controller
 
 logger = logging.getLogger(__name__)
 
+REDACTED = "***REDACTED***"
+
+# Header names (lower-cased) that carry secrets on outbound webhook calls and
+# must be scrubbed from any config exposed over the API (item 2).
+_SENSITIVE_HEADER_NAMES = frozenset({
+    "authorization",
+    "x-api-token",
+    "x-api-key",
+    "api-key",
+    "proxy-authorization",
+    "x-auth-token",
+    "x-webhook-secret",
+})
+
 # ── Blueprint ──────────────────────────────────────────────────────────────────
 
 api_bp = Blueprint("api", __name__, url_prefix="/api")
 
+PUBLIC_ENDPOINTS = {
+    "api.health",
+    "api.auth_config",
+    "api.login",
+}
+
+
+class _StreamTicketStore:
+    """Short-lived, single-use tickets for SSE authentication.
+
+    A browser's EventSource API cannot send Authorization/X-API-Token headers,
+    and the ?token= query path was removed (item 31) so long-lived credentials
+    never appear in URLs/logs. Instead a client POSTs to /api/stream/ticket with
+    normal header auth, receives a single-use ticket that expires in TTL_SEC, and
+    opens EventSource("/api/stream?ticket=<ticket>"). The ticket is consumed on
+    connect, is short-lived, and carries no reusable secret.
+    """
+
+    TTL_SEC = 30.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tickets: dict[str, tuple[UserPrincipal, float]] = {}
+
+    def _prune(self, now: float) -> None:
+        for tok in [t for t, (_, exp) in self._tickets.items() if now > exp]:
+            self._tickets.pop(tok, None)
+
+    def issue(self, principal: UserPrincipal, now: float) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._prune(now)
+            self._tickets[token] = (principal, now + self.TTL_SEC)
+        return token
+
+    def consume(self, token: str, now: float) -> UserPrincipal | None:
+        with self._lock:
+            self._prune(now)
+            entry = self._tickets.pop(token, None)
+        if entry is None:
+            return None
+        principal, expiry = entry
+        return principal if now <= expiry else None
+
+ROLE_REQUIREMENTS: dict[tuple[str, str], str] = {
+    ("GET", "/api/users"): "admin",
+    ("GET", "/api/config/raw"): "admin",
+    ("GET", "/api/db/stats"): "admin",
+    ("POST", "/api/db/flush"): "admin",
+    ("POST", "/api/db/prune"): "admin",
+    ("POST", "/api/alerts"): "operator",
+    ("POST", "/api/config/reload"): "operator",
+    ("PUT", "/api/config/interfaces"): "operator",
+    ("PUT", "/api/config/wan-mode"): "operator",
+    ("POST", "/api/control/start"): "operator",
+    ("POST", "/api/control/pause"): "operator",
+    ("POST", "/api/control/resume"): "operator",
+    ("POST", "/api/control/stop"): "operator",
+    ("POST", "/api/control/kill"): "operator",
+}
+
+
+def _auth_enabled() -> bool:
+    cfg: AppConfig = current_app.config["CFG"]
+    return bool(getattr(cfg.server, "auth_enabled", True))
+
+
+def _shadow_mode_enabled() -> bool:
+    """Return True when shadow (dry-run Layer 1) mode is active.
+
+    Delegates to network._shadow_enabled() so the API banner agrees exactly
+    with what the route layer is doing; falls back to reading the env var
+    directly if network lands without that helper.
+    """
+    try:
+        from wancontrol import network
+
+        checker = getattr(network, "_shadow_enabled", None)
+        if callable(checker):
+            return bool(checker())
+    except ImportError:
+        pass
+    import os
+
+    return os.environ.get("WANCONTROL_SHADOW", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _remote_addr_allowed() -> bool:
+    """Item 1: enforce server.allowed_cidrs against the request's remote_addr.
+
+    Returns True when no allow-list is configured (empty/missing) or when the
+    peer address falls inside at least one configured CIDR. An unparseable
+    allow-list entry is ignored (does not widen access); an unparseable
+    remote_addr is rejected when an allow-list is present.
+    """
+    cfg: AppConfig = current_app.config["CFG"]
+    allowed = getattr(cfg.server, "allowed_cidrs", None) or []
+    if not allowed:
+        return True
+
+    remote = request.remote_addr
+    if not remote:
+        return False
+    try:
+        peer = ipaddress.ip_address(remote)
+    except ValueError:
+        return False
+
+    for entry in allowed:
+        try:
+            network = ipaddress.ip_network(str(entry), strict=False)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid allowed_cidrs entry %r", entry,
+                extra={"component": "api"},
+            )
+            continue
+        if peer.version == network.version and peer in network:
+            return True
+    return False
+
+
+def _local_principal() -> UserPrincipal:
+    return UserPrincipal(
+        user_id=0,
+        username="local",
+        role="admin",
+        source="disabled",
+        requires_password_change=False,
+    )
+
+
+def _auth() -> Auth:
+    return current_app.config["AUTH"]
+
+
+def _json_auth_error(exc: AuthError, status: int) -> tuple[Response, int]:
+    return jsonify({"error": exc.code, "message": exc.message}), status
+
+
+def _principal_from_request() -> UserPrincipal:
+    if not _auth_enabled():
+        return _local_principal()
+
+    api_token = request.headers.get("X-API-Token")
+    if api_token:
+        return _auth().verify_api_token(api_token)
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return _auth().verify_token(auth_header.split(" ", 1)[1].strip())
+
+    # Item 31: tokens are accepted via headers only; the ?token= query-string
+    # branch was removed so credentials never land in URLs / access logs.
+    raise AuthError("Authentication required.", "authentication_required")
+
+
+def current_principal() -> UserPrincipal:
+    principal = getattr(request, "principal", None)
+    if principal is None:
+        principal = _principal_from_request()
+        setattr(request, "principal", principal)
+    return principal
+
+
+def require_role(minimum_role: str):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            principal = current_principal()
+            try:
+                _auth().require_role(principal, minimum_role)
+            except AuthError as exc:
+                return _json_auth_error(exc, 403)
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
 # ── Serialisation helpers ──────────────────────────────────────────────────────
 
 def _user_to_dict(user: UserRow) -> dict[str, Any]:
-    """Serialise a UserRow, explicitly omitting password_hash."""
     return {
         "id": user.id,
         "username": user.username,
@@ -60,21 +255,7 @@ def _user_to_dict(user: UserRow) -> dict[str, Any]:
     }
 
 
-def _token_to_dict(token: ApiTokenRow) -> dict[str, Any]:
-    """Serialise an ApiTokenRow, omitting token_hash."""
-    return {
-        "id": token.id,
-        "user_id": token.user_id,
-        "label": token.label,
-        "created_at": token.created_at,
-        "last_used": token.last_used,
-        "expires_at": token.expires_at,
-        "is_revoked": token.is_revoked,
-    }
-
-
 def _metric_to_dict(m: MetricRow) -> dict[str, Any]:
-    """Serialise a MetricRow with explicit bool coercion for dns_ok/http_ok."""
     return {
         "id": m.id,
         "interface": m.interface,
@@ -100,198 +281,150 @@ def _alert_to_dict(a) -> dict[str, Any]:
     }
 
 
-# ── Auth helpers ───────────────────────────────────────────────────────────────
+def _discovered_interface_to_dict(iface: DiscoveredInterface) -> dict[str, Any]:
+    return {
+        "name": iface.name,
+        "label": iface.label,
+        "mac": iface.mac,
+        "ip": iface.ip,
+        "prefix_len": iface.prefix_len,
+        "gateway": iface.gateway,
+        "speed_mbps": iface.speed_mbps,
+        "is_up": iface.is_up,
+        "is_reachable": iface.is_reachable,
+        "is_wan_candidate": iface.is_wan_candidate,
+        "skip_reason": iface.skip_reason,
+        "suggested_routing_table_id": iface.suggested_routing_table_id,
+    }
 
-_AUTH_ERROR_STATUS: dict[str, int] = {
-    "token_expired": 401,
-    "token_invalid": 401,
-    "token_revoked": 401,
-    "user_inactive": 403,
-    "insufficient_role": 403,
-    "invalid_credentials": 401,
-}
 
+def _redact_raw_config(data: Any) -> Any:
+    """Return a copy of parsed config.yaml with secrets scrubbed (item 2).
 
-def _auth_error_status(code: str) -> int:
-    """Map an AuthError code to an HTTP status code."""
-    return _AUTH_ERROR_STATUS.get(code, 401)
-
-
-def _resolve_principal() -> tuple[UserPrincipal | None, tuple | None]:
+    Redacts ``server.secret_key`` and any auth-bearing headers configured on
+    alerting webhooks. The input is never mutated.
     """
-    Resolve the caller's identity from request headers.
+    if not isinstance(data, dict):
+        return data
 
-    Token resolution order:
-      1. ``Authorization: Bearer <jwt>``  → auth.verify_token()
-      2. ``X-API-Token: <raw>``           → auth.verify_api_token()
+    redacted: dict[str, Any] = dict(data)
 
-    Returns ``(UserPrincipal, None)`` on success.
-    Returns ``(None, (response, status))`` on any auth failure.
-    Error responses carry ``Cache-Control: no-store``.
+    server = redacted.get("server")
+    if isinstance(server, dict) and "secret_key" in server:
+        server = dict(server)
+        server["secret_key"] = REDACTED
+        redacted["server"] = server
+
+    alerting = redacted.get("alerting")
+    if isinstance(alerting, dict):
+        webhooks = alerting.get("webhooks")
+        if isinstance(webhooks, list):
+            new_webhooks = []
+            for wh in webhooks:
+                if isinstance(wh, dict) and isinstance(wh.get("headers"), dict):
+                    wh = dict(wh)
+                    wh["headers"] = {
+                        k: (REDACTED if str(k).lower() in _SENSITIVE_HEADER_NAMES else v)
+                        for k, v in wh["headers"].items()
+                    }
+                new_webhooks.append(wh)
+            alerting = dict(alerting)
+            alerting["webhooks"] = new_webhooks
+            redacted["alerting"] = alerting
+
+    return redacted
+
+
+def _sync_reloaded_config(new_cfg: AppConfig) -> None:
+    """Propagate a reloaded config into the running app (items 21/29).
+
+    This ONLY swaps the cached AppConfig + rebuilds Auth and delegates route
+    reconciliation to ``Controller.update_config`` (which performs the
+    diff-based, lock-guarded teardown/setup). It MUST NOT call
+    ``setup_all_interfaces`` itself — doing so would double-apply routes on top
+    of the controller's own diff. Env overrides are already re-applied inside
+    ``Config.reload()`` (the parse path reads WANCONTROL_* every time).
     """
-    auth: Auth = current_app.config["AUTH"]
-    auth_header = request.headers.get("Authorization", "")
-    api_token_header = request.headers.get("X-API-Token", "")
-
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        try:
-            return auth.verify_token(token), None
-        except AuthError as err:
-            status = _auth_error_status(err.code)
-            resp = jsonify({"error": err.code, "message": err.message})
-            resp.headers["Cache-Control"] = "no-store"
-            return None, (resp, status)
-
-    if api_token_header:
-        try:
-            return auth.verify_api_token(api_token_header), None
-        except AuthError as err:
-            status = _auth_error_status(err.code)
-            resp = jsonify({"error": err.code, "message": err.message})
-            resp.headers["Cache-Control"] = "no-store"
-            return None, (resp, status)
-
-    resp = jsonify({"error": "unauthorized", "message": "Authentication required."})
-    resp.headers["Cache-Control"] = "no-store"
-    return None, (resp, 401)
-
-
-# ── Auth decorators ────────────────────────────────────────────────────────────
-
-def require_auth(f: Any) -> Any:
-    """
-    Decorator — resolves caller identity and injects ``g.principal``.
-
-    Token resolution order:
-      1. ``Authorization: Bearer <jwt>``  → auth.verify_token()
-      2. ``X-API-Token: <raw>``           → auth.verify_api_token()
-
-    Returns 401 JSON on any AuthError.
-    Sets ``Cache-Control: no-store`` on error responses.
-    """
-    @wraps(f)
-    def decorated(*args: Any, **kwargs: Any) -> Any:
-        principal, err = _resolve_principal()
-        if err is not None:
-            logger.warning(
-                "Auth failure on %s %s", request.method, request.path,
-                extra={"component": "api"},
-            )
-            return err
-        g.principal = principal
-        return f(*args, **kwargs)
-    return decorated
-
-
-def require_role(minimum_role: str) -> Any:
-    """
-    Decorator factory — wraps require_auth and enforces a minimum role.
-
-    Calls ``auth.require_role(g.principal, minimum_role)``.
-    Returns 403 JSON if the caller's role rank is insufficient.
-    """
-    def decorator(f: Any) -> Any:
-        @wraps(f)
-        def decorated(*args: Any, **kwargs: Any) -> Any:
-            principal, err = _resolve_principal()
-            if err is not None:
-                logger.warning(
-                    "Auth failure on %s %s", request.method, request.path,
-                    extra={"component": "api"},
-                )
-                return err
-            g.principal = principal
-            auth: Auth = current_app.config["AUTH"]
-            try:
-                auth.require_role(g.principal, minimum_role)
-            except AuthError as role_err:
-                logger.warning(
-                    "Insufficient role on %s %s: %s",
-                    request.method, request.path, role_err.code,
-                    extra={"component": "api"},
-                )
-                return jsonify({"error": role_err.code, "message": role_err.message}), 403
-            return f(*args, **kwargs)
-        return decorated
-    return decorator
+    current_app.config["CFG"] = new_cfg
+    current_app.config["AUTH"] = Auth(db=current_app.config["DB"], server_cfg=new_cfg.server)
+    controller: Controller = current_app.config["CONTROLLER"]
+    update = getattr(controller, "update_config", None)
+    if callable(update):
+        update(new_cfg)
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 
 @api_bp.route("/health", methods=["GET"])
 def health() -> tuple[Response, int]:
-    """Return service health. Never exposes internal errors."""
-    try:
-        return jsonify({
-            "status": "ok",
-            "version": __version__,
-            "timestamp": time.time(),
-        }), 200
-    except Exception:
-        return jsonify({"status": "ok"}), 200
+    return jsonify({
+        "status": "ok",
+        "version": __version__,
+        "timestamp": time.time(),
+    }), 200
 
 
-# ── Auth endpoints ─────────────────────────────────────────────────────────────
+@api_bp.route("/auth/config", methods=["GET"])
+def auth_config() -> tuple[Response, int]:
+    return jsonify({"auth_enabled": _auth_enabled()}), 200
+
 
 @api_bp.route("/auth/login", methods=["POST"])
 def login() -> tuple[Response, int]:
-    """Authenticate with username/password and return a JWT token pair."""
-    body = request.get_json(force=True, silent=True)
-    if not body or "username" not in body or "password" not in body:
-        return jsonify({"error": "bad_request", "message": "username and password required."}), 400
+    if not _auth_enabled():
+        return jsonify({
+            "access_token": "",
+            "token_type": "disabled",
+            "expires_in": 0,
+            "requires_password_change": False,
+        }), 200
 
-    auth: Auth = current_app.config["AUTH"]
+    body = request.get_json(force=True, silent=True) or {}
+    username = body.get("username")
+    password = body.get("password")
+    if not username or not password:
+        return jsonify({"error": "bad_request", "message": "username and password are required."}), 400
     try:
-        token_pair = auth.authenticate(body["username"], body["password"])
-    except AuthError as err:
-        logger.warning(
-            "Login failure for %r: %s", body.get("username"), err.code,
-            extra={"component": "api"},
-        )
-        return jsonify({"error": err.code, "message": err.message}), _auth_error_status(err.code)
-
-    return jsonify(dataclasses.asdict(token_pair)), 200
+        pair = _auth().authenticate(str(username), str(password))
+    except AuthError as exc:
+        return _json_auth_error(exc, 401)
+    return jsonify(dataclasses.asdict(pair)), 200
 
 
 @api_bp.route("/auth/logout", methods=["POST"])
-@require_auth
 def logout() -> tuple[Response, int]:
-    """Acknowledge logout. JWTs are stateless; session invalidation is Phase 7."""
-    return jsonify({"message": "logged out"}), 200
+    return jsonify({"logged_out": True}), 200
 
 
 @api_bp.route("/auth/change-password", methods=["POST"])
-@require_auth
 def change_password() -> tuple[Response, int]:
-    """Change the authenticated user's password."""
-    body = request.get_json(force=True, silent=True)
-    if not body or "old_password" not in body or "new_password" not in body:
-        return jsonify({"error": "bad_request", "message": "old_password and new_password required."}), 400
-
-    auth: Auth = current_app.config["AUTH"]
+    principal = current_principal()
+    if principal.user_id == 0:
+        return jsonify({"changed": True}), 200
+    body = request.get_json(force=True, silent=True) or {}
+    old_password = body.get("old_password")
+    new_password = body.get("new_password")
+    if not old_password or not new_password:
+        return jsonify({"error": "bad_request", "message": "old_password and new_password are required."}), 400
     try:
-        auth.change_password(g.principal.user_id, body["old_password"], body["new_password"])
-    except AuthError as err:
-        return jsonify({"error": err.code, "message": err.message}), 400
-
-    return jsonify({"message": "password changed"}), 200
+        _auth().change_password(principal.user_id, str(old_password), str(new_password))
+    except AuthError as exc:
+        return _json_auth_error(exc, 400)
+    return jsonify({"changed": True}), 200
 
 
 # ── Status ─────────────────────────────────────────────────────────────────────
 
 @api_bp.route("/status", methods=["GET"])
-@require_role("viewer")
 def get_status() -> tuple[Response, int]:
-    """Return current controller status."""
     controller: Controller = current_app.config["CONTROLLER"]
-    return jsonify(controller.get_status()), 200
+    status = dict(controller.get_status())
+    status["shadow_mode"] = _shadow_mode_enabled()
+    return jsonify(status), 200
 
 
 @api_bp.route("/status/interfaces", methods=["GET"])
-@require_role("viewer")
 def get_interfaces_status() -> tuple[Response, int]:
-    """Return per-interface config merged with live controller state."""
     cfg: AppConfig = current_app.config["CFG"]
     controller: Controller = current_app.config["CONTROLLER"]
     status = controller.get_status()
@@ -313,12 +446,45 @@ def get_interfaces_status() -> tuple[Response, int]:
     return jsonify(result), 200
 
 
+@api_bp.route("/control/start", methods=["POST"])
+def control_start() -> tuple[Response, int]:
+    controller: Controller = current_app.config["CONTROLLER"]
+    controller.start()
+    return jsonify(controller.get_status()), 200
+
+
+@api_bp.route("/control/pause", methods=["POST"])
+def control_pause() -> tuple[Response, int]:
+    controller: Controller = current_app.config["CONTROLLER"]
+    controller.pause()
+    return jsonify(controller.get_status()), 200
+
+
+@api_bp.route("/control/resume", methods=["POST"])
+def control_resume() -> tuple[Response, int]:
+    controller: Controller = current_app.config["CONTROLLER"]
+    controller.resume()
+    return jsonify(controller.get_status()), 200
+
+
+@api_bp.route("/control/stop", methods=["POST"])
+def control_stop() -> tuple[Response, int]:
+    controller: Controller = current_app.config["CONTROLLER"]
+    controller.stop()
+    return jsonify(controller.get_status()), 200
+
+
+@api_bp.route("/control/kill", methods=["POST"])
+def control_kill() -> tuple[Response, int]:
+    controller: Controller = current_app.config["CONTROLLER"]
+    controller.kill()
+    return jsonify(controller.get_status()), 200
+
+
 # ── Metrics ────────────────────────────────────────────────────────────────────
 
 @api_bp.route("/metrics", methods=["GET"])
-@require_role("viewer")
 def get_metrics() -> tuple[Response, int]:
-    """Fetch recent metrics, optionally filtered by interface and time window."""
     db: Database = current_app.config["DB"]
     interface = request.args.get("interface") or None
 
@@ -340,9 +506,7 @@ def get_metrics() -> tuple[Response, int]:
 
 
 @api_bp.route("/metrics/latest", methods=["GET"])
-@require_role("viewer")
 def get_latest_metrics() -> tuple[Response, int]:
-    """Return the most recent metric row for each configured interface."""
     cfg: AppConfig = current_app.config["CFG"]
     db: Database = current_app.config["DB"]
     result: dict[str, Any] = {}
@@ -352,12 +516,21 @@ def get_latest_metrics() -> tuple[Response, int]:
     return jsonify(result), 200
 
 
+# ── Interface discovery ───────────────────────────────────────────────────────
+
+@api_bp.route("/interfaces/discover", methods=["GET"])
+def discover_network_interfaces() -> tuple[Response, int]:
+    interfaces = discover_interfaces()
+    return jsonify({
+        "interfaces": [_discovered_interface_to_dict(i) for i in interfaces],
+        "suggested_config": generate_config_fragment_dict(interfaces),
+    }), 200
+
+
 # ── Events ─────────────────────────────────────────────────────────────────────
 
 @api_bp.route("/events/switches", methods=["GET"])
-@require_role("viewer")
 def get_switch_events() -> tuple[Response, int]:
-    """Return recent WAN switch events."""
     db: Database = current_app.config["DB"]
     try:
         limit = int(request.args.get("limit", 50))
@@ -368,9 +541,7 @@ def get_switch_events() -> tuple[Response, int]:
 
 
 @api_bp.route("/events/controller", methods=["GET"])
-@require_role("viewer")
 def get_controller_events() -> tuple[Response, int]:
-    """Return recent controller events, optionally filtered by level."""
     db: Database = current_app.config["DB"]
     try:
         limit = int(request.args.get("limit", 100))
@@ -384,9 +555,7 @@ def get_controller_events() -> tuple[Response, int]:
 # ── Alerts ─────────────────────────────────────────────────────────────────────
 
 @api_bp.route("/alerts", methods=["GET"])
-@require_role("viewer")
 def get_alerts() -> tuple[Response, int]:
-    """Return recent alerts."""
     db: Database = current_app.config["DB"]
     try:
         limit = int(request.args.get("limit", 20))
@@ -397,9 +566,7 @@ def get_alerts() -> tuple[Response, int]:
 
 
 @api_bp.route("/alerts/<int:alert_id>/resolve", methods=["POST"])
-@require_role("operator")
 def resolve_alert(alert_id: int) -> tuple[Response, int]:
-    """Mark an alert as resolved. Returns 404 if the alert does not exist."""
     db: Database = current_app.config["DB"]
     existing = db.get_recent_alerts(limit=100_000)
     if not any(a.id == alert_id for a in existing):
@@ -411,146 +578,102 @@ def resolve_alert(alert_id: int) -> tuple[Response, int]:
 # ── Users ──────────────────────────────────────────────────────────────────────
 
 @api_bp.route("/users", methods=["GET"])
-@require_role("admin")
 def list_users() -> tuple[Response, int]:
-    """Return all users. password_hash is never included."""
     db: Database = current_app.config["DB"]
     return jsonify([_user_to_dict(u) for u in db.list_users()]), 200
 
 
 @api_bp.route("/users", methods=["POST"])
-@require_role("admin")
 def create_user() -> tuple[Response, int]:
-    """Create a new user. Returns 400 on weak password or duplicate username."""
     body = request.get_json(force=True, silent=True)
-    if not body or "username" not in body or "password" not in body or "role" not in body:
-        return jsonify({"error": "bad_request", "message": "username, password, role required."}), 400
-
-    auth: Auth = current_app.config["AUTH"]
+    if not body:
+        return jsonify({"error": "bad_request", "message": "valid JSON body required."}), 400
     try:
-        user_id = auth.create_user(
-            body["username"],
-            body["password"],
-            body["role"],
-            created_by_user_id=g.principal.user_id,
+        user_id = _auth().create_user(
+            str(body.get("username") or ""),
+            str(body.get("password") or ""),
+            str(body.get("role") or "viewer"),
+            created_by_user_id=current_principal().user_id,
         )
-    except AuthError as err:
-        return jsonify({"error": err.code, "message": err.message}), 400
-
-    return jsonify({"id": user_id, "username": body["username"], "role": body["role"]}), 201
+    except (AuthError, ValueError) as exc:
+        return jsonify({"error": getattr(exc, "code", "bad_request"), "message": str(exc)}), 400
+    user = current_app.config["DB"].get_user_by_id(user_id)
+    return jsonify(_user_to_dict(user)), 201
 
 
 @api_bp.route("/users/<int:user_id>", methods=["GET"])
-@require_role("admin")
 def get_user(user_id: int) -> tuple[Response, int]:
-    """Return a single user. password_hash excluded. 404 if not found."""
-    db: Database = current_app.config["DB"]
-    user = db.get_user_by_id(user_id)
+    user = current_app.config["DB"].get_user_by_id(user_id)
     if user is None:
         return jsonify({"error": "not_found", "message": "User not found."}), 404
     return jsonify(_user_to_dict(user)), 200
 
 
 @api_bp.route("/users/<int:user_id>/deactivate", methods=["POST"])
-@require_role("admin")
 def deactivate_user(user_id: int) -> tuple[Response, int]:
-    """Deactivate a user account."""
-    auth: Auth = current_app.config["AUTH"]
     try:
-        auth.deactivate_user(user_id, g.principal.user_id)
-    except AuthError as err:
-        if err.code == "user_not_found":
-            return jsonify({"error": "not_found", "message": err.message}), 404
-        return jsonify({"error": err.code, "message": err.message}), 400
-    return jsonify({"deactivated": True, "user_id": user_id}), 200
+        _auth().deactivate_user(user_id, current_principal().user_id)
+    except AuthError as exc:
+        return _json_auth_error(exc, 404)
+    return jsonify({"deactivated": True, "id": user_id}), 200
 
 
 @api_bp.route("/users/<int:user_id>/role", methods=["POST"])
-@require_role("admin")
 def update_user_role(user_id: int) -> tuple[Response, int]:
-    """Update a user's role. Returns 400 on invalid role value."""
-    body = request.get_json(force=True, silent=True)
-    if not body or "role" not in body:
-        return jsonify({"error": "bad_request", "message": "role required."}), 400
-
-    auth: Auth = current_app.config["AUTH"]
+    body = request.get_json(force=True, silent=True) or {}
     try:
-        auth.update_role(user_id, body["role"], g.principal.user_id)
-    except ValueError as err:
-        return jsonify({"error": "bad_request", "message": str(err)}), 400
-    except AuthError as err:
-        if err.code == "user_not_found":
-            return jsonify({"error": "not_found", "message": err.message}), 404
-        return jsonify({"error": err.code, "message": err.message}), 400
-    return jsonify({"user_id": user_id, "role": body["role"]}), 200
+        _auth().update_role(user_id, str(body.get("role") or ""), current_principal().user_id)
+    except (AuthError, ValueError) as exc:
+        return jsonify({"error": getattr(exc, "code", "bad_request"), "message": str(exc)}), 400
+    return jsonify({"updated": True, "id": user_id}), 200
 
-
-# ── API Tokens ─────────────────────────────────────────────────────────────────
 
 @api_bp.route("/tokens", methods=["GET"])
-@require_auth
 def list_tokens() -> tuple[Response, int]:
-    """Return API tokens. Admins may pass ?all=true to see all users' tokens."""
-    auth: Auth = current_app.config["AUTH"]
-    show_all = request.args.get("all", "").lower() == "true"
-    if show_all and g.principal.role == "admin":
-        tokens = auth.list_api_tokens()
-    else:
-        tokens = auth.list_api_tokens(user_id=g.principal.user_id)
-    return jsonify([_token_to_dict(t) for t in tokens]), 200
+    principal = current_principal()
+    rows = _auth().list_api_tokens(user_id=None if principal.role == "admin" else principal.user_id)
+    return jsonify([dataclasses.asdict(r) for r in rows]), 200
 
 
 @api_bp.route("/tokens", methods=["POST"])
-@require_auth
 def create_token() -> tuple[Response, int]:
-    """Create a new API token. The raw token value is shown exactly once."""
-    body = request.get_json(force=True, silent=True)
-    if not body or "label" not in body:
-        return jsonify({"error": "bad_request", "message": "label required."}), 400
-
-    expires_in_days: int | None = body.get("expires_in_days")
-    if expires_in_days is not None:
-        try:
-            expires_in_days = int(expires_in_days)
-        except (TypeError, ValueError):
-            return jsonify({"error": "bad_request", "message": "expires_in_days must be an integer."}), 400
-
-    auth: Auth = current_app.config["AUTH"]
+    principal = current_principal()
+    body = request.get_json(force=True, silent=True) or {}
+    label = str(body.get("label") or "").strip()
+    if not label:
+        return jsonify({"error": "bad_request", "message": "label is required."}), 400
+    expires = body.get("expires_in_days")
     try:
-        raw_token = auth.create_api_token(g.principal.user_id, body["label"], expires_in_days)
-    except AuthError as err:
-        return jsonify({"error": err.code, "message": err.message}), 400
-
-    return jsonify({"token": raw_token, "label": body["label"]}), 201
+        expires_days = int(expires) if expires is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "bad_request", "message": "expires_in_days must be an integer."}), 400
+    try:
+        token = _auth().create_api_token(principal.user_id, label, expires_days)
+    except AuthError as exc:
+        return _json_auth_error(exc, 400)
+    rows = _auth().list_api_tokens(user_id=principal.user_id)
+    token_id = rows[0].id if rows else None
+    return jsonify({"id": token_id, "token": token, "label": label}), 201
 
 
 @api_bp.route("/tokens/<int:token_id>", methods=["DELETE"])
-@require_auth
-def delete_token(token_id: int) -> tuple[Response, int]:
-    """Revoke an API token. Users may revoke their own; admins may revoke any."""
-    db: Database = current_app.config["DB"]
-    auth: Auth = current_app.config["AUTH"]
-
-    user_tokens = db.list_api_tokens(user_id=g.principal.user_id)
-    is_own = any(t.id == token_id for t in user_tokens)
-
-    if not is_own and g.principal.role != "admin":
-        return jsonify({"error": "forbidden", "message": "Cannot revoke another user's token."}), 403
-
-    auth.revoke_api_token(token_id, g.principal.user_id)
-    return jsonify({"revoked": True, "token_id": token_id}), 200
+def revoke_token(token_id: int) -> tuple[Response, int]:
+    principal = current_principal()
+    rows = _auth().list_api_tokens(user_id=None if principal.role == "admin" else principal.user_id)
+    if not any(row.id == token_id for row in rows):
+        return jsonify({"error": "insufficient_role", "message": "Cannot revoke another user's token."}), 403
+    _auth().revoke_api_token(token_id, principal.user_id)
+    return jsonify({"revoked": True, "id": token_id}), 200
 
 
 # ── Config reload ──────────────────────────────────────────────────────────────
 
 @api_bp.route("/config/reload", methods=["POST"])
-@require_role("operator")
 def reload_config() -> tuple[Response, int]:
-    """Hot-reload config.yaml. db_path is not hot-reloadable."""
     cfg: AppConfig = current_app.config["CFG"]
     cfg_loader: Config = current_app.config["CFG_LOADER"]
     new_cfg = cfg_loader.reload()
-    # reload() returns the same object on failure and a new object on success
+    _sync_reloaded_config(new_cfg)
     reloaded = new_cfg is not cfg
     return jsonify({
         "reloaded": reloaded,
@@ -562,17 +685,13 @@ def reload_config() -> tuple[Response, int]:
 # ── Database admin ─────────────────────────────────────────────────────────────
 
 @api_bp.route("/db/stats", methods=["GET"])
-@require_role("admin")
 def db_stats() -> tuple[Response, int]:
-    """Return database row counts and file size."""
     db: Database = current_app.config["DB"]
     return jsonify(dataclasses.asdict(db.get_db_stats())), 200
 
 
 @api_bp.route("/db/prune", methods=["POST"])
-@require_role("admin")
 def db_prune() -> tuple[Response, int]:
-    """Prune data older than configured retention thresholds."""
     db: Database = current_app.config["DB"]
     cfg: AppConfig = current_app.config["CFG"]
     result = db.prune_old_data(cfg.retention.metrics_hours, cfg.retention.events_days)
@@ -580,27 +699,30 @@ def db_prune() -> tuple[Response, int]:
 
 
 @api_bp.route("/db/flush", methods=["POST"])
-@require_role("admin")
 def db_flush() -> tuple[Response, int]:
-    """Flush all metrics and events. Preserves users, state, and schema."""
     db: Database = current_app.config["DB"]
     db.flush_all_data()
     return jsonify({"flushed": True}), 200
 
 
-# ── SSE stream / config edit endpoints (Phase 7) ---------------------------
+# ── SSE stream ─────────────────────────────────────────────────────────────────
+
+@api_bp.route("/stream/ticket", methods=["POST"])
+def sse_ticket():
+    """Mint a short-lived single-use ticket for EventSource (see _StreamTicketStore).
+
+    Requires normal auth (enforced by before_request). The ticket inherits the
+    caller's principal/role and is the only credential the browser puts in the
+    /api/stream URL.
+    """
+    principal = current_principal()
+    store: _StreamTicketStore = current_app.config["STREAM_TICKETS"]
+    ticket = store.issue(principal, time.time())
+    return jsonify({"ticket": ticket, "expires_in": int(_StreamTicketStore.TTL_SEC)}), 200
 
 
 @api_bp.route("/stream", methods=["GET"])
 def sse_stream():
-    # EventSource cannot set headers — accept token from query param
-    token = request.args.get("token", "")
-    auth: Auth = current_app.config["AUTH"]
-    try:
-        principal = auth.verify_token(token)
-    except AuthError as e:
-        return jsonify({"error": e.code, "message": e.message}), 401
-
     controller: Controller = current_app.config["CONTROLLER"]
     cfg: AppConfig = current_app.config["CFG"]
     db: Database = current_app.config["DB"]
@@ -608,18 +730,17 @@ def sse_stream():
     def event_stream():
         last_alert_id = 0
         while True:
-            # Push status
             status = controller.get_status()
             yield f"event: status\ndata: {_json.dumps(status)}\n\n"
 
-            # Push latest metrics
             latest = {
-                iface.name: _metric_to_dict(db.get_latest_metric(iface.name))
+                iface.name: (
+                    _metric_to_dict(row) if (row := db.get_latest_metric(iface.name)) else None
+                )
                 for iface in cfg.interfaces
             }
             yield f"event: metric\ndata: {_json.dumps(latest)}\n\n"
 
-            # Push any new unnotified alerts
             for alert in db.get_unnotified_alerts():
                 if alert.id > last_alert_id:
                     last_alert_id = alert.id
@@ -634,8 +755,45 @@ def sse_stream():
     )
 
 
+# ── Shadow mode (dry-run Layer 1) ───────────────────────────────────────────────
+
+def _intended_route_to_dict(row: Any) -> dict[str, Any]:
+    """Normalise an intended-route record (dataclass / dict / tuple) to JSON."""
+    if dataclasses.is_dataclass(row) and not isinstance(row, type):
+        return dataclasses.asdict(row)
+    if isinstance(row, dict):
+        return dict(row)
+    # Fallback for sqlite Row / tuple shaped as (id, ts, command).
+    try:
+        return {"id": row[0], "ts": row[1], "command": row[2]}
+    except (TypeError, IndexError, KeyError):
+        return {"value": row}
+
+
+@api_bp.route("/shadow/intended", methods=["GET"])
+def get_shadow_intended() -> tuple[Response, int]:
+    db: Database = current_app.config["DB"]
+    try:
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        return jsonify({"error": "bad_request", "message": "limit must be an integer."}), 400
+
+    lister = getattr(db, "list_intended_routes", None)
+    if not callable(lister):
+        # Shadow recorder/table not present (older DB) — report empty rather than 500.
+        rows: list[Any] = []
+    else:
+        rows = lister(limit=limit)
+    return jsonify({
+        "shadow_mode": _shadow_mode_enabled(),
+        "intended_routes": [_intended_route_to_dict(r) for r in rows],
+    }), 200
+
+
+# ── Config edit ────────────────────────────────────────────────────────────────
+
 @api_bp.route("/config/raw", methods=["GET"])
-@require_role("operator")
+@require_role("admin")
 def get_config_raw():
     cfg_loader: Config = current_app.config["CFG_LOADER"]
     path: Path = cfg_loader._path
@@ -644,11 +802,28 @@ def get_config_raw():
             content = fh.read()
     except FileNotFoundError:
         return jsonify({"error": "not_found", "message": "config.yaml not found"}), 404
-    return Response(content, mimetype="text/plain; charset=utf-8"), 200
+
+    # Item 2: never return secrets verbatim. Parse, redact, re-serialise.
+    try:
+        data = yaml.safe_load(content) or {}
+    except yaml.YAMLError:
+        # Malformed YAML can't be safely redacted token-by-token, so refuse
+        # rather than risk leaking the secret_key in raw text.
+        logger.warning(
+            "config.yaml is not valid YAML; refusing to return raw contents",
+            extra={"component": "api"},
+        )
+        return jsonify({
+            "error": "config_invalid",
+            "message": "config.yaml is not valid YAML and cannot be safely returned.",
+        }), 500
+
+    redacted = _redact_raw_config(data)
+    rendered = yaml.safe_dump(redacted, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    return Response(rendered, mimetype="text/plain; charset=utf-8"), 200
 
 
 @api_bp.route("/config/interfaces", methods=["PUT"])
-@require_role("operator")
 def put_config_interfaces():
     body = request.get_json(force=True, silent=True)
     if not body or "interfaces" not in body:
@@ -656,7 +831,6 @@ def put_config_interfaces():
 
     new_raw = body["interfaces"]
     try:
-        # Validate via existing parser
         _parse_interfaces(new_raw)
     except ConfigError as err:
         return jsonify({"error": "ConfigError", "message": str(err)}), 400
@@ -670,12 +844,39 @@ def put_config_interfaces():
         return jsonify({"error": "not_found", "message": "config.yaml not found"}), 404
 
     data["interfaces"] = new_raw
-
     with cfg_path.open("w", encoding="utf-8") as fh:
         yaml.dump(data, fh, allow_unicode=True, default_flow_style=False)
 
-    cfg_loader.reload()
+    new_cfg = cfg_loader.reload()
+    _sync_reloaded_config(new_cfg)
     return jsonify({"updated": True, "interfaces": len(new_raw)}), 200
+
+
+@api_bp.route("/config/wan-mode", methods=["PUT"])
+def put_config_wan_mode():
+    body = request.get_json(force=True, silent=True)
+    mode = (body or {}).get("wan_mode")
+    if mode not in VALID_WAN_MODES:
+        return jsonify({
+            "error": "bad_request",
+            "message": f"wan_mode must be one of {sorted(VALID_WAN_MODES)}",
+        }), 400
+
+    cfg_loader: Config = current_app.config["CFG_LOADER"]
+    cfg_path: Path = cfg_loader._path
+    try:
+        with cfg_path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        return jsonify({"error": "not_found", "message": "config.yaml not found"}), 404
+
+    data["wan_mode"] = mode
+    with cfg_path.open("w", encoding="utf-8") as fh:
+        yaml.dump(data, fh, allow_unicode=True, default_flow_style=False)
+
+    new_cfg = cfg_loader.reload()
+    _sync_reloaded_config(new_cfg)
+    return jsonify({"updated": True, "wan_mode": new_cfg.wan_mode}), 200
 
 
 # ── Application factory ────────────────────────────────────────────────────────
@@ -686,32 +887,70 @@ def create_app(
     db: Database,
     controller: Controller,
 ) -> Flask:
-    """
-    Application factory. Called once at startup by the entrypoint.
-
-    Stores shared objects on app.config:
-        app.config["CFG"]        = cfg
-        app.config["CFG_LOADER"] = cfg_loader
-        app.config["DB"]         = db
-        app.config["AUTH"]       = Auth(db, cfg.server)
-        app.config["CONTROLLER"] = controller
-
-    Registers all blueprints and error handlers.
-    Sets Flask secret_key from cfg.server.secret_key.
-    """
     app = Flask(__name__)
-    app.secret_key = cfg.server.secret_key
 
     app.config["CFG"] = cfg
     app.config["CFG_LOADER"] = cfg_loader
     app.config["DB"] = db
-    app.config["AUTH"] = Auth(db, cfg.server)
     app.config["CONTROLLER"] = controller
+    app.config["AUTH"] = Auth(db=db, server_cfg=cfg.server)
+    app.config["STREAM_TICKETS"] = _StreamTicketStore()
 
     app.register_blueprint(api_bp)
 
-    # Serve frontend dist (SPA) if present
-    FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+    @app.before_request
+    def authenticate_request():
+        if not request.path.startswith("/api/"):
+            return None
+        if request.url_rule is None or request.endpoint == "spa_catchall":
+            return None
+        # Item 1: network allow-list gate runs before authentication so peers
+        # outside allowed_cidrs cannot reach even public endpoints (e.g. login).
+        if not _remote_addr_allowed():
+            logger.warning(
+                "Rejected %s %s from disallowed remote_addr %s",
+                request.method, request.path, request.remote_addr,
+                extra={"component": "api"},
+            )
+            return jsonify({
+                "error": "forbidden_network",
+                "message": "Source address not permitted.",
+            }), 401
+        if request.endpoint in PUBLIC_ENDPOINTS:
+            return None
+        # SSE ticket path: a browser EventSource cannot send auth headers, so
+        # GET /api/stream accepts a short-lived single-use ?ticket= minted via
+        # POST /api/stream/ticket. Header auth still works for non-browser clients.
+        if request.endpoint == "api.sse_stream" and _auth_enabled():
+            ticket = request.args.get("ticket")
+            if ticket:
+                store: _StreamTicketStore = current_app.config["STREAM_TICKETS"]
+                principal = store.consume(ticket, time.time())
+                if principal is None:
+                    return _json_auth_error(
+                        AuthError("Invalid or expired stream ticket.", "authentication_required"), 401
+                    )
+                setattr(request, "principal", principal)
+                return None
+        try:
+            principal = _principal_from_request()
+            setattr(request, "principal", principal)
+            required_role = "viewer"
+            if request.path.startswith("/api/alerts/") and request.path.endswith("/resolve") and request.method == "POST":
+                required_role = "operator"
+            elif request.path.startswith("/api/users"):
+                required_role = "admin"
+            elif request.path.startswith("/api/tokens"):
+                required_role = "viewer"
+            else:
+                required_role = ROLE_REQUIREMENTS.get((request.method, request.path), "viewer")
+            _auth().require_role(principal, required_role)
+        except AuthError as exc:
+            status = 403 if exc.code == "insufficient_role" else 401
+            return _json_auth_error(exc, status)
+        return None
+
+    FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist_app"
 
     @app.route("/assets/<path:filename>")
     def static_assets(filename: str):
@@ -720,21 +959,13 @@ def create_app(
     @app.route("/", defaults={"path": ""})
     @app.route("/<path:path>")
     def spa_catchall(path: str):
+        if path.startswith("api/"):
+            abort(404)
         return send_from_directory(FRONTEND_DIST, "index.html")
-
-    # ── Error handlers ─────────────────────────────────────────────────────
 
     @app.errorhandler(400)
     def bad_request(e: Exception) -> tuple[Response, int]:
         return jsonify({"error": "bad_request", "message": str(e)}), 400
-
-    @app.errorhandler(401)
-    def unauthorized(e: Exception) -> tuple[Response, int]:
-        return jsonify({"error": "unauthorized", "message": str(e)}), 401
-
-    @app.errorhandler(403)
-    def forbidden(e: Exception) -> tuple[Response, int]:
-        return jsonify({"error": "forbidden", "message": str(e)}), 403
 
     @app.errorhandler(404)
     def not_found(e: Exception) -> tuple[Response, int]:
@@ -747,22 +978,17 @@ def create_app(
     @app.errorhandler(500)
     def internal_error(e: Exception) -> tuple[Response, int]:
         logger.error(
-            "Unhandled internal error: %s\n%s",
-            e,
-            traceback.format_exc(),
+            "Unhandled internal error: %s\n%s", e, traceback.format_exc(),
             extra={"component": "api"},
         )
         return jsonify({"error": "internal_server_error", "message": "Internal server error."}), 500
 
-    # ── After-request logging ──────────────────────────────────────────────
-
     @app.after_request
     def log_request(response: Response) -> Response:
+        if request.path.startswith("/api/") and request.endpoint not in PUBLIC_ENDPOINTS:
+            response.headers.setdefault("Cache-Control", "no-store")
         logger.debug(
-            "%s %s %d",
-            request.method,
-            request.path,
-            response.status_code,
+            "%s %s %d", request.method, request.path, response.status_code,
             extra={"component": "api"},
         )
         return response

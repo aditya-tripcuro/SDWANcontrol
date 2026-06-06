@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # ── Schema version ────────────────────────────────────────────────────────────
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 # ── Row dataclasses ───────────────────────────────────────────────────────────
 
@@ -83,6 +83,7 @@ class UserRow:
     created_at: float
     last_login: float | None
     is_active: bool
+    requires_password_change: bool
 
 
 @dataclass
@@ -106,6 +107,13 @@ class AlertRow:
     body: str
     resolved_at: float | None
     notified: bool
+
+
+@dataclass
+class IntendedRouteRow:
+    id: int
+    ts: float
+    command: str
 
 
 @dataclass
@@ -135,6 +143,7 @@ def _user_from_row(r: sqlite3.Row) -> "UserRow":
     return UserRow(
         id=r[0], username=r[1], password_hash=r[2], role=r[3],
         created_at=r[4], last_login=r[5], is_active=bool(r[6]),
+        requires_password_change=bool(r[7]),
     )
 
 
@@ -150,6 +159,10 @@ def _alert_from_row(r: sqlite3.Row) -> "AlertRow":
         id=r[0], timestamp=r[1], level=r[2], title=r[3],
         body=r[4], resolved_at=r[5], notified=bool(r[6]),
     )
+
+
+def _intended_route_from_row(r: sqlite3.Row) -> "IntendedRouteRow":
+    return IntendedRouteRow(id=r[0], ts=r[1], command=r[2])
 
 
 # ── Migrations ────────────────────────────────────────────────────────────────
@@ -212,7 +225,8 @@ MIGRATIONS: dict[int, str] = {
             role            TEXT    NOT NULL DEFAULT 'viewer',
             created_at      REAL    NOT NULL,
             last_login      REAL,
-            is_active       INTEGER NOT NULL DEFAULT 1
+            is_active       INTEGER NOT NULL DEFAULT 1,
+            requires_password_change INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS api_tokens (
@@ -240,6 +254,19 @@ MIGRATIONS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_alerts_ts
             ON alerts(timestamp DESC);
     """,
+    # Migration 2 reconciles CURRENT_SCHEMA_VERSION (=2) with a real migration
+    # (item 37 — previously the constant was 2 but only migration 1 existed) and
+    # adds the shadow-mode intended-routes ledger. Shadow mode (dry-run Layer 1)
+    # records every intended `ip` command instead of mutating the kernel.
+    2: """
+        CREATE TABLE IF NOT EXISTS intended_routes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          REAL    NOT NULL,
+            command     TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_intended_routes_ts
+            ON intended_routes(ts DESC);
+    """,
 }
 
 
@@ -258,6 +285,13 @@ class Database:
         self._path = Path(db_path)
         self._local = threading.local()
         self._write_lock = threading.Lock()  # serialise writes across threads
+        # The in-memory connection is SHARED across threads, so the check-then-
+        # BEGIN sequence in _conn() can race (two threads both see no open
+        # transaction and both issue BEGIN -> "cannot start a transaction within
+        # a transaction"). This re-entrant lock makes the begin/commit atomic for
+        # the shared connection. File DBs use per-thread connections and do not
+        # take this lock.
+        self._mem_txn_lock = threading.RLock()
         # In-memory databases use a single persistent connection shared across
         # threads so that close() → reconnect does not destroy schema and data.
         # WAL mode is not supported for :memory:; foreign_keys and synchronous
@@ -270,6 +304,7 @@ class Database:
             )
             self._mem_conn.execute("PRAGMA foreign_keys=ON")
             self._mem_conn.execute("PRAGMA synchronous=NORMAL")
+            self._mem_conn.execute("PRAGMA busy_timeout=5000")
             self._mem_conn.row_factory = sqlite3.Row
 
     # ── Setup ──────────────────────────────────────────────────────────────
@@ -280,10 +315,36 @@ class Database:
         # PRAGMAs are set by _conn() on first connection creation (outside any
         # transaction); calling them again inside a BEGIN would raise OperationalError.
         self._run_migrations()
+        # The DB (and its WAL/SHM sidecars) may contain credential hashes and
+        # API token hashes; default umask can leave them world-readable. Tighten
+        # to owner rw / group r (item 35).
+        self._restrict_file_permissions()
         logger.info(
             "Database initialized",
             extra={"component": "database", "path": str(self._path)},
         )
+
+    def _restrict_file_permissions(self) -> None:
+        """``chmod 0640`` the database file and any WAL/SHM sidecars (item 35).
+
+        No-op for in-memory databases. Best-effort: a chmod failure (e.g. the
+        file is owned by another user) is logged, not raised, so startup is not
+        blocked by a permissions hiccup.
+        """
+        if self._mem_conn is not None:
+            return
+        for suffix in ("", "-wal", "-shm"):
+            target = Path(str(self._path) + suffix)
+            if not target.exists():
+                continue
+            try:
+                os.chmod(target, 0o640)
+            except OSError as exc:
+                logger.warning(
+                    "Could not chmod 0640 %s: %s",
+                    target, exc,
+                    extra={"component": "database"},
+                )
 
     # ── Metrics ────────────────────────────────────────────────────────────
 
@@ -443,8 +504,14 @@ class Database:
             )
 
     def get_state(self, key: str, default: str | None = None) -> str | None:
-        """Read a state value. Uses BEGIN EXCLUSIVE to prevent IPC races."""
-        with self._conn(exclusive=True) as conn:
+        """Read a state value.
+
+        Uses a non-exclusive (deferred) read transaction: in WAL mode a reader
+        sees the last committed value without acquiring the write lock, so the
+        high-frequency status/SSE reads don't contend with the metric writer
+        (item 13). set_state() remains BEGIN EXCLUSIVE + _write_lock for writes.
+        """
+        with self._conn(exclusive=False) as conn:
             row = conn.execute(
                 "SELECT value FROM state WHERE key = ?", (key,)
             ).fetchone()
@@ -462,12 +529,13 @@ class Database:
         username: str,
         password_hash: str,
         role: str,
+        requires_password_change: bool = False,
     ) -> int:
         with self._write_lock, self._conn() as conn:
             cur = conn.execute(
-                "INSERT INTO users(username, password_hash, role, created_at) "
-                "VALUES(?, ?, ?, ?)",
-                (username, password_hash, role, time.time()),
+                "INSERT INTO users(username, password_hash, role, created_at, requires_password_change) "
+                "VALUES(?, ?, ?, ?, ?)",
+                (username, password_hash, role, time.time(), int(requires_password_change)),
             )
         return cur.lastrowid  # type: ignore[return-value]
 
@@ -475,7 +543,7 @@ class Database:
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT id, username, password_hash, role, created_at, "
-                "last_login, is_active FROM users WHERE username = ?",
+                "last_login, is_active, requires_password_change FROM users WHERE username = ?",
                 (username,),
             ).fetchone()
         return _user_from_row(row) if row else None
@@ -484,7 +552,7 @@ class Database:
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT id, username, password_hash, role, created_at, "
-                "last_login, is_active FROM users WHERE id = ?",
+                "last_login, is_active, requires_password_change FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
         return _user_from_row(row) if row else None
@@ -493,7 +561,7 @@ class Database:
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT id, username, password_hash, role, created_at, "
-                "last_login, is_active FROM users ORDER BY created_at"
+                "last_login, is_active, requires_password_change FROM users ORDER BY created_at"
             ).fetchall()
         return [_user_from_row(r) for r in rows]
 
@@ -516,6 +584,13 @@ class Database:
             conn.execute(
                 "UPDATE users SET role = ? WHERE id = ?",
                 (role, user_id),
+            )
+
+    def set_requires_password_change(self, user_id: int, value: bool) -> None:
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "UPDATE users SET requires_password_change = ? WHERE id = ?",
+                (1 if value else 0, user_id),
             )
 
     def deactivate_user(self, user_id: int) -> None:
@@ -631,6 +706,32 @@ class Database:
                 (limit,),
             ).fetchall()
         return [_alert_from_row(r) for r in rows]
+
+    # ── Shadow mode (intended routes) ──────────────────────────────────────
+
+    def record_intended_route(self, command: str) -> None:
+        """
+        Append an intended (but not executed) routing command.
+
+        Used by shadow mode (dry-run Layer 1): instead of mutating the kernel,
+        network.py records each `ip` command it *would* have run so operators
+        can review intended-vs-current route diffs before going live.
+        """
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                "INSERT INTO intended_routes(ts, command) VALUES(?, ?)",
+                (time.time(), command),
+            )
+
+    def list_intended_routes(self, limit: int = 100) -> list[IntendedRouteRow]:
+        """Return the most recently recorded intended routing commands."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, ts, command "
+                "FROM intended_routes ORDER BY ts DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_intended_route_from_row(r) for r in rows]
 
     # ── Retention / pruning ────────────────────────────────────────────────
 
@@ -783,6 +884,20 @@ class Database:
                 "Migration v%d applied", version, extra={"component": "database"}
             )
 
+        self._ensure_requires_password_change_column()
+
+    def _ensure_requires_password_change_column(self) -> None:
+        """Repair older v1 databases created before first-login reset support."""
+        with self._write_lock, self._conn() as conn:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "requires_password_change" not in columns:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN requires_password_change "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+
     # ── Connection management ──────────────────────────────────────────────
 
     @contextmanager
@@ -813,8 +928,18 @@ class Database:
                 self._local.conn.execute("PRAGMA journal_mode=WAL")
                 self._local.conn.execute("PRAGMA foreign_keys=ON")
                 self._local.conn.execute("PRAGMA synchronous=NORMAL")
+                # Wait up to 5s for a contended lock (e.g. the ExecStop
+                # --restore-routes process vs the dying main process) instead of
+                # failing immediately with "database is locked".
+                self._local.conn.execute("PRAGMA busy_timeout=5000")
                 self._local.conn.row_factory = sqlite3.Row
             conn = self._local.conn
+        # The shared in-memory connection needs the check-then-BEGIN to be atomic
+        # across threads (see __init__). Per-thread file connections are not
+        # shared, so they take no lock. RLock allows nested _conn() on one thread.
+        shared_lock = self._mem_txn_lock if self._mem_conn is not None else None
+        if shared_lock is not None:
+            shared_lock.acquire()
         try:
             # If the caller is already inside a transaction (e.g. nested _conn
             # calls), just yield without opening another BEGIN.
@@ -838,3 +963,6 @@ class Database:
                 "SQLite error: %s", exc, extra={"component": "database"}
             )
             raise
+        finally:
+            if shared_lock is not None:
+                shared_lock.release()

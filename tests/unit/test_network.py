@@ -25,16 +25,18 @@ def test_find_available_port_returns_start(tmp_path):
 
 
 def test_find_available_port_skips_occupied():
-    start = 55100
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(('0.0.0.0', start))
-
+    # Ask the OS for a free port and genuinely occupy it (listen()), rather than
+    # binding a hardcoded constant that may already be in use on the host.
+    occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    occupied.bind(('0.0.0.0', 0))
+    occupied.listen(1)
+    taken = occupied.getsockname()[1]
     try:
-        port = find_available_port(start=start, max_attempts=2)
-        assert start <= port < start + 2
+        port = find_available_port(start=taken, max_attempts=5)
+        assert port != taken              # the occupied port was skipped
+        assert taken < port <= taken + 4  # picked a nearby free port
     finally:
-        s.close()
+        occupied.close()
 
 
 def test_find_available_port_raises_if_none():
@@ -110,10 +112,11 @@ def test_restore_default_routes_calls_ip_replace(mock_run):
     restore_default_routes(db)
 
     # ensure subprocess.run was called for ip route replace
+    # (restore now emits the explicit IPv4 family flag: `ip -4 route replace default`)
     called = False
     for call in mock_run.call_args_list:
         args = call[0][0]
-        if args[:4] == ['ip', 'route', 'replace', 'default']:
+        if args[:2] == ['ip', '-4'] and args[2:5] == ['route', 'replace', 'default']:
             called = True
             assert 'via' in args and '203.0.113.1' in args
             assert 'dev' in args and 'eth0' in args

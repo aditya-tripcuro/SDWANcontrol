@@ -299,17 +299,17 @@ class TestIcmpProbeAggregation:
             assert result[4] == 2     # targets_ok
 
     def test_one_target_fails(self, monitor: Monitor, iface: InterfaceConfig):
-        """One target fails (loss=100): excluded from latency average"""
+        """One target fails (loss=100): latency/jitter use ok target only, but
+        loss is averaged across ALL targets (item 15) so a partial outage shows."""
         with patch("wancontrol.monitor.probe_icmp") as mock_probe:
             mock_probe.side_effect = [
                 (10.0, 1.0, 0.0),    # target 1 ok
                 (0.0, 0.0, 100.0),   # target 2 failed
             ]
             result = monitor._run_icmp_probes(iface, "192.168.1.100")
-            # Only target 1 is ok, so avg is just its values
-            assert result[0] == 10.0  # avg_latency (only ok target)
+            assert result[0] == 10.0  # avg_latency (only ok target — can't measure a dead one)
             assert result[1] == 1.0   # avg_jitter (only ok target)
-            assert result[2] == 0.0   # avg_loss (only ok target)
+            assert result[2] == 50.0  # avg_loss across ALL targets: (0 + 100) / 2
             assert result[3] == 2     # targets_tried
             assert result[4] == 1     # targets_ok
 
@@ -749,14 +749,14 @@ class TestFailureHandling:
             assert wan1_metric.is_hard_fail is False
             assert wan1_metric.score == 100.0
 
-    def test_make_fail_metric_returns_zeros(self, monitor: Monitor):
-        """make_fail_metric() returns score=0.0, is_hard_fail=True, all zeros"""
+    def test_make_fail_metric_returns_hard_failure(self, monitor: Monitor):
+        """make_fail_metric() returns score=0.0, is_hard_fail=True, 100% loss"""
         metric = monitor.make_fail_metric("wan0")
         assert metric.score == 0.0
         assert metric.is_hard_fail is True
         assert metric.latency_ms == 0.0
         assert metric.jitter_ms == 0.0
-        assert metric.loss_pct == 0.0
+        assert metric.loss_pct == 100.0
         assert metric.dns_ok is False
         assert metric.http_ok is False
 

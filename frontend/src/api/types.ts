@@ -1,16 +1,10 @@
-export interface TokenPair {
-  access_token: string
-  token_type: string
-  expires_in: number
-}
-
 export interface InterfaceStatus {
   name: string
   label: string
   expected_speed_mbps: number
   gateway: string
   routing_table_id: number
-  wan_state: 'STABLE' | 'DEGRADED' | 'FAILED' | 'SWITCHING'
+  wan_state: 'STABLE' | 'DEGRADED' | 'FAILED'
   score: number
   in_pool: boolean
 }
@@ -21,7 +15,7 @@ export interface ControllerStatus {
   active_interface: string | null
   nexthop_pool: string[]
   interfaces: Record<string, {
-    wan_state: 'STABLE' | 'DEGRADED' | 'FAILED' | 'SWITCHING'
+    wan_state: 'STABLE' | 'DEGRADED' | 'FAILED'
     score: number
     in_pool: boolean
   }>
@@ -77,6 +71,7 @@ export interface UserRow {
   created_at: number
   last_login: number | null
   is_active: boolean
+  requires_password_change: boolean
 }
 
 export interface ApiTokenRow {

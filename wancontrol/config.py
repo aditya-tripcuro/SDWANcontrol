@@ -40,6 +40,7 @@ class InterfaceConfig:
     expected_speed_mbps: int
     gateway: str
     routing_table_id: int
+    gateway6: str | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,11 @@ class ScoringConfig:
     hysteresis_switch_to_backup: float
     hysteresis_return_to_primary: float
     recovery_margin: float
+    # Anti-flap (items 11/16). Defaults applied via raw.get so old configs still load.
+    fail_confirmations: int = 3
+    recover_confirmations: int = 5
+    min_switch_interval_sec: int = 60
+    return_stability_sec: int = 30
 
 
 @dataclass(frozen=True)
@@ -73,6 +79,7 @@ class ControllerConfig:
     metric_collection_timeout_sec: int
     heartbeat_interval_sec: int
     heartbeat_stale_sec: int
+    auto_start: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,8 @@ class ServerConfig:
     secret_key: str
     jwt_expiry_hours: int
     session_timeout_minutes: int
+    auth_enabled: bool = True
+    allowed_cidrs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -209,12 +218,16 @@ def _parse_interfaces(raw: list) -> list[InterfaceConfig]:
         if not gateway:
             raise ConfigError(f"{s}.gateway must be a non-empty string")
 
+        gateway6_raw = item.get("gateway6")
+        gateway6 = str(gateway6_raw) if gateway6_raw else None
+
         result.append(InterfaceConfig(
             name=name,
             label=label,
             expected_speed_mbps=int(_require_positive(item, "expected_speed_mbps", s)),
             gateway=gateway,
             routing_table_id=table_id,
+            gateway6=gateway6,
         ))
 
     return result
@@ -234,6 +247,16 @@ def _parse_probes(raw: dict) -> ProbeConfig:
     )
 
 
+def _optional_positive_int(d: dict, key: str, section: str, default: int) -> int:
+    """Return int(d[key]) if present (must be a positive number), else the default."""
+    if key not in d:
+        return default
+    val = d[key]
+    if not isinstance(val, (int, float)) or isinstance(val, bool) or val <= 0:
+        raise ConfigError(f"[{section}].{key} must be a positive number, got {val!r}")
+    return int(val)
+
+
 def _parse_scoring(raw: dict) -> ScoringConfig:
     s = "scoring"
     return ScoringConfig(
@@ -245,6 +268,11 @@ def _parse_scoring(raw: dict) -> ScoringConfig:
         hysteresis_switch_to_backup=_require_non_negative(raw, "hysteresis_switch_to_backup", s),
         hysteresis_return_to_primary=_require_non_negative(raw, "hysteresis_return_to_primary", s),
         recovery_margin=_require_non_negative(raw, "recovery_margin", s),
+        # Anti-flap (items 11/16): optional, fall back to dataclass defaults.
+        fail_confirmations=_optional_positive_int(raw, "fail_confirmations", s, 3),
+        recover_confirmations=_optional_positive_int(raw, "recover_confirmations", s, 5),
+        min_switch_interval_sec=_optional_positive_int(raw, "min_switch_interval_sec", s, 60),
+        return_stability_sec=_optional_positive_int(raw, "return_stability_sec", s, 30),
     )
 
 
@@ -256,6 +284,7 @@ def _parse_controller(raw: dict) -> ControllerConfig:
         metric_collection_timeout_sec=int(_require_positive(raw, "metric_collection_timeout_sec", s)),
         heartbeat_interval_sec=int(_require_positive(raw, "heartbeat_interval_sec", s)),
         heartbeat_stale_sec=int(_require_positive(raw, "heartbeat_stale_sec", s)),
+        auto_start=bool(raw.get("auto_start", False)),
     )
 
 
@@ -291,6 +320,7 @@ def _parse_alerting(raw: dict) -> AlertingConfig:
 
 def _parse_server(raw: dict) -> ServerConfig:
     s = "server"
+    auth_enabled = bool(raw.get("auth_enabled", True))
     secret = str(_require(raw, "secret_key", s)).strip()
     _PLACEHOLDER_KEYS = {
         "CHANGE_THIS_TO_A_RANDOM_STRING",
@@ -309,12 +339,18 @@ def _parse_server(raw: dict) -> ServerConfig:
             )
     if len(secret) < 32:
         raise ConfigError("[server].secret_key must be at least 32 characters")
+    raw_cidrs = raw.get("allowed_cidrs", []) or []
+    if not isinstance(raw_cidrs, list):
+        raise ConfigError("[server].allowed_cidrs must be a list of CIDR strings")
+    allowed_cidrs = [str(c).strip() for c in raw_cidrs if str(c).strip()]
     return ServerConfig(
         host=str(raw.get("host", "0.0.0.0")),
         port=int(_require_positive(raw, "port", s)),
         secret_key=secret,
+        auth_enabled=auth_enabled,
         jwt_expiry_hours=int(_require_positive(raw, "jwt_expiry_hours", s)),
         session_timeout_minutes=int(_require_positive(raw, "session_timeout_minutes", s)),
+        allowed_cidrs=allowed_cidrs,
     )
 
 
@@ -411,6 +447,17 @@ class Config:
     def on_reload(self, callback: Callable[[AppConfig], None]) -> None:
         """Register a callback(new_config: AppConfig) called after successful reload."""
         self._reload_callbacks.append(callback)
+
+    def register_sighup(self) -> None:
+        """Configure the process to call .reload() when it receives SIGHUP."""
+        if not hasattr(signal, "SIGHUP"):
+            return
+
+        def _handler(signum: int, frame: Any) -> None:  # noqa: ARG001
+            logger.info("Received SIGHUP, reloading config", extra={"component": "config"})
+            self.reload()
+
+        signal.signal(signal.SIGHUP, _handler)
 
     @property
     def current(self) -> AppConfig:

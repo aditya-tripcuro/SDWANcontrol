@@ -1,41 +1,53 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useMemo } from "react";
 import { sseManager } from "../api/sse";
 import { useAlertCount } from "../context/AlertCountContext";
-import { useAuth } from "../auth/AuthContext";
+import { useTimezone } from "../context/TimezoneContext";
 import {
-  LineChart,
+  ComposedChart,
   Line,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
-  AreaChart,
   Area,
   PieChart,
   Pie,
   Cell,
 } from "recharts";
+import { getStatus, getMetrics, getInterfacesStatus } from "../api/client";
+import type { InterfaceStatus } from "../api/types";
 
-import { getStatus, getMetrics } from "../api/client";
+const IFACE_COLORS = ["#ffffff", "#38bdf8", "#4ade80", "#fbbf24", "#f87171", "#a78bfa"];
 
 const DashboardPage: React.FC = () => {
   const [status, setStatus] = useState<any>(null);
-  const [metrics, setMetrics] = useState<Record<string, any>>({});
+  const [liveMetrics, setLiveMetrics] = useState<Record<string, any>>({});
+  const [ifaceStatus, setIfaceStatus] = useState<InterfaceStatus[]>([]);
   const [historicalMetrics, setHistoricalMetrics] = useState<any[]>([]);
   const alertCtx = useAlertCount();
-  const auth = useAuth();
+  const { timezone, formatTs } = useTimezone();
 
   useEffect(() => {
-    if (!auth.token) return;
-
-    // Fetch initial data
     getStatus().then(setStatus).catch(console.error);
-    getMetrics({ limit: 50 }).then(setHistoricalMetrics).catch(console.error);
+    getMetrics({ limit: 100 }).then(setHistoricalMetrics).catch(console.error);
+    getInterfacesStatus().then(setIfaceStatus).catch(console.error);
+    sseManager.connect();
 
-    const onStatus = (d: unknown) => setStatus(d as any);
-    const onMetric = (d: unknown) => setMetrics(d as any);
-    const onAlert = (d: unknown) => { alertCtx.increment(); };
+    const onStatus = (d: any) => {
+      setStatus(d);
+      setIfaceStatus((prev) =>
+        prev.map((iface) => ({
+          ...iface,
+          wan_state: d?.interfaces?.[iface.name]?.wan_state ?? iface.wan_state,
+          score: d?.interfaces?.[iface.name]?.score ?? iface.score,
+          in_pool: d?.interfaces?.[iface.name]?.in_pool ?? iface.in_pool,
+        }))
+      );
+    };
+    const onMetric = (d: unknown) => setLiveMetrics(d as Record<string, any>);
+    const onAlert = () => alertCtx.increment();
+
     sseManager.on("status", onStatus);
     sseManager.on("metric", onMetric);
     sseManager.on("alert", onAlert);
@@ -44,223 +56,352 @@ const DashboardPage: React.FC = () => {
       sseManager.off("metric", onMetric);
       sseManager.off("alert", onAlert);
     };
-  }, [auth.token, alertCtx]);
+  }, []);
 
-  // Map real data for charts, fallback to mock if empty
-  const performanceData = historicalMetrics.length > 0 
-    ? historicalMetrics.map(m => ({
-        time: new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        latency: m.latency_ms,
-        jitter: m.jitter_ms
-      })).reverse()
-    : [
-    { time: "00:00", latency: 25, jitter: 2 },
-    { time: "04:00", latency: 28, jitter: 3 },
-    { time: "08:00", latency: 45, jitter: 12 },
-    { time: "12:00", latency: 30, jitter: 4 },
-    { time: "16:00", latency: 35, jitter: 6 },
-    { time: "20:00", latency: 22, jitter: 2 },
-  ];
+  // Compute averages across all interfaces from live SSE metric data
+  const liveValues = Object.values(liveMetrics).filter(Boolean);
+  const avgLatency =
+    liveValues.length > 0
+      ? (liveValues.reduce((s: number, m: any) => s + (m?.latency_ms ?? 0), 0) / liveValues.length).toFixed(1)
+      : null;
+  const avgJitter =
+    liveValues.length > 0
+      ? (liveValues.reduce((s: number, m: any) => s + (m?.jitter_ms ?? 0), 0) / liveValues.length).toFixed(1)
+      : null;
+  const avgLoss =
+    liveValues.length > 0
+      ? (liveValues.reduce((s: number, m: any) => s + (m?.loss_pct ?? 0), 0) / liveValues.length).toFixed(2)
+      : null;
+  const avgScore =
+    liveValues.length > 0
+      ? (liveValues.reduce((s: number, m: any) => s + (m?.score ?? 0), 0) / liveValues.length).toFixed(1)
+      : null;
 
-  const trafficData = [
-    { name: "HTTP/S", value: 450, color: "#ffffff" },
-    { name: "Streaming", value: 300, color: "#b7c8e1" },
-    { name: "VPN", value: 150, color: "#f87171" },
-    { name: "Other", value: 100, color: "#444749" },
-  ];
+  // Build telemetry chart data: average latency + jitter per time bucket across all interfaces
+  const telemetryData = useMemo(() => {
+    if (historicalMetrics.length === 0) return [];
+    const sorted = [...historicalMetrics].reverse();
+    const buckets: Record<string, { time: string; latSum: number; jitSum: number; n: number }> = {};
+    sorted.forEach((m) => {
+      const time = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }).format(new Date(m.timestamp * 1000));
+      if (!buckets[time]) buckets[time] = { time, latSum: 0, jitSum: 0, n: 0 };
+      buckets[time].latSum += m.latency_ms;
+      buckets[time].jitSum += m.jitter_ms;
+      buckets[time].n++;
+    });
+    return Object.values(buckets).map((b) => ({
+      time: b.time,
+      latency: parseFloat((b.latSum / b.n).toFixed(2)),
+      jitter: parseFloat((b.jitSum / b.n).toFixed(2)),
+    }));
+  }, [historicalMetrics, timezone]);
 
-  const MetricCard = ({ title, value, unit, trend, colorClass }: any) => (
-    <div className="bg-surface-container-low p-6 rounded-xl border border-outline-variant/20 hover:border-primary/30 transition-all duration-300 group shadow-sm hover:shadow-primary/5">
-      <div className="flex justify-between items-start mb-6">
-        <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-text-muted group-hover:text-primary transition-colors">{title}</h3>
-        <div className={`p-2 rounded-lg bg-surface-bright/50 border border-outline-variant/30 text-text-strong group-hover:border-primary/50 transition-all`}>
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" /></svg>
+  // Interface score pie chart data
+  const scorePieData = useMemo(
+    () =>
+      ifaceStatus.map((iface, i) => ({
+        name: iface.label || iface.name,
+        value: Math.max(0.5, iface.score ?? 0),
+        color: IFACE_COLORS[i % IFACE_COLORS.length],
+      })),
+    [ifaceStatus]
+  );
+
+  const pieAvgScore =
+    ifaceStatus.length > 0
+      ? (ifaceStatus.reduce((s, i) => s + (i.score ?? 0), 0) / ifaceStatus.length).toFixed(1)
+      : "—";
+
+  const activeLinks = Object.values(status?.interfaces || {}).filter((i: any) => (i.score ?? 0) > 20).length;
+  const totalLinks = Object.keys(status?.interfaces || {}).length;
+  const globalScore = (
+    Object.values(status?.interfaces || {}).reduce((acc: number, i: any) => acc + (i.score ?? 0), 0) /
+    (Object.keys(status?.interfaces || {}).length || 1)
+  ).toFixed(1);
+
+  const MetricCard = ({ title, value, unit, icon }: any) => (
+    <div className="bg-surface-container-low p-5 rounded-xl border border-outline-variant/20 hover:border-primary/30 transition-all duration-300 group shadow-sm hover:shadow-primary/5">
+      <div className="flex justify-between items-start mb-4">
+        <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-text-muted group-hover:text-primary transition-colors">
+          {title}
+        </h3>
+        <div className="p-1.5 rounded bg-surface-bright/50 border border-outline-variant/30 text-text-strong group-hover:border-primary/50 transition-all">
+          {icon}
         </div>
       </div>
-      <div className="flex items-baseline space-x-2">
-        <span className="text-3xl font-black text-text-strong tracking-tighter tabular-nums">{value}</span>
-        <span className="text-xs font-bold text-text-muted uppercase">{unit}</span>
+      <div className="flex items-baseline space-x-1.5">
+        <span className="text-2xl font-black text-text-strong tracking-tighter tabular-nums">
+          {value ?? "—"}
+        </span>
+        {unit && <span className="text-[10px] font-bold text-text-muted uppercase">{unit}</span>}
       </div>
-      <div className="mt-6 pt-4 border-t border-outline-variant/10 flex items-center justify-between">
-        <div className="flex items-center space-x-2">
-          <span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${trend.startsWith('-') ? 'bg-success-green/10 text-success-green' : 'bg-error-red/10 text-error-red'}`}>
-            {trend}
-          </span>
-          <span className="text-[9px] text-text-muted font-bold uppercase tracking-tight">vs last hour</span>
-        </div>
-        <div className="w-12 h-6 opacity-30 group-hover:opacity-100 transition-opacity">
-           {/* Mini Sparkline placeholder */}
-           <svg viewBox="0 0 48 24" className="w-full h-full"><path d="M0 20 L8 15 L16 18 L24 10 L32 12 L40 5 L48 8" fill="none" stroke="currentColor" strokeWidth="2" className={trend.startsWith('-') ? 'text-success-green' : 'text-error-red'} /></svg>
-        </div>
-      </div>
+      {value === null && (
+        <p className="mt-3 text-[9px] text-text-muted font-bold uppercase tracking-wide">Awaiting data</p>
+      )}
     </div>
   );
 
   return (
-    <div className="space-y-8 pb-12 animate-in fade-in slide-in-from-bottom-4 duration-700">
-      {/* Welcome Section */}
-      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-black text-text-strong tracking-tight">Network Overview</h1>
-          <p className="text-text-muted text-sm mt-1 font-medium">Real-time health monitoring for <span className="text-primary">wan-cluster-alpha</span></p>
-        </div>
-        <div className="flex items-center space-x-3 text-[10px] font-black uppercase tracking-widest text-text-muted bg-surface-container-low px-4 py-2 rounded-full border border-outline-variant/20">
-           <span className="flex h-2 w-2 rounded-full bg-success-green"></span>
-           <span>Last synced: {new Date().toLocaleTimeString()}</span>
-        </div>
-      </div>
-
-      {/* Metrics Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        <MetricCard title="System Latency" value={metrics.latency || "24.5"} unit="ms" trend="-2.4%" />
-        <MetricCard title="Jitter Variance" value={metrics.jitter || "3.2"} unit="ms" trend="+0.5%" />
-        <MetricCard title="Packet Integrity" value={metrics.packet_loss ? (100 - metrics.packet_loss).toFixed(2) : "99.98"} unit="%" trend="+0.01%" />
-        <MetricCard title="Peak Throughput" value={metrics.throughput || "842"} unit="Mbps" trend="+12.3%" />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Performance Chart */}
-        <div className="lg:col-span-2 bg-surface-container-low p-8 rounded-2xl border border-outline-variant/20 shadow-sm relative overflow-hidden group">
-          <div className="absolute top-0 right-0 p-8 opacity-5 group-hover:opacity-10 transition-opacity pointer-events-none">
-             <svg className="w-32 h-32" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14.5v-9l6 4.5-6 4.5z"/></svg>
+    <div className="space-y-6 pb-12 animate-in fade-in slide-in-from-bottom-4 duration-700">
+      {/* System Status Header */}
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-surface-container-low/50 p-6 rounded-2xl border border-outline-variant/20 backdrop-blur-sm">
+        <div className="flex items-center space-x-4">
+          <div className="w-12 h-12 rounded-2xl bg-primary text-primary-on flex items-center justify-center shadow-lg shadow-white/10">
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
           </div>
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-10 gap-4">
+          <div>
+            <h1 className="text-xl font-black text-text-strong tracking-tight leading-none">
+              WANControl Dashboard
+            </h1>
+            <p className="text-text-muted text-[11px] mt-1.5 font-bold uppercase tracking-widest flex items-center space-x-2">
+              <span className="w-2 h-2 rounded-full bg-success-green animate-pulse"></span>
+              <span>
+                Mode:{" "}
+                <span className="text-primary">{status?.wan_mode ?? "…"}</span>
+                {status?.active_interface && (
+                  <> · Active: <span className="text-primary">{status.active_interface}</span></>
+                )}
+              </span>
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center space-x-6 h-full">
+          <div className="flex flex-col items-end border-r border-outline-variant/30 pr-6">
+            <span className="text-[10px] font-black text-text-muted uppercase tracking-widest">Active Links</span>
+            <span className="text-lg font-black text-text-strong">
+              {totalLinks > 0 ? `${activeLinks} / ${totalLinks}` : "—"}
+            </span>
+          </div>
+          <div className="flex flex-col items-end">
+            <span className="text-[10px] font-black text-text-muted uppercase tracking-widest">Global Score</span>
+            <span className={`text-lg font-black ${parseFloat(globalScore) > 80 ? "text-success-green" : parseFloat(globalScore) > 50 ? "text-warning-amber" : "text-error-red"}`}>
+              {totalLinks > 0 ? globalScore : "—"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Primary Metrics Grid — real live data from SSE metric event */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <MetricCard
+          title="Avg Latency"
+          value={avgLatency}
+          unit="ms"
+          icon={<svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}
+        />
+        <MetricCard
+          title="Avg Jitter"
+          value={avgJitter}
+          unit="ms"
+          icon={<svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" /></svg>}
+        />
+        <MetricCard
+          title="Avg Packet Loss"
+          value={avgLoss}
+          unit="%"
+          icon={<svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 5.636l-3.536 3.536m0 5.656l3.536 3.536M9.172 9.172L5.636 5.636m3.536 9.192l-3.536 3.536M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-5 0a4 4 0 11-8 0 4 4 0 018 0z" /></svg>}
+        />
+        <MetricCard
+          title="Avg Score"
+          value={avgScore}
+          unit="/ 100"
+          icon={<svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Telemetry Chart — real historical metrics */}
+        <div className="lg:col-span-2 bg-surface-container-low p-6 rounded-2xl border border-outline-variant/20 shadow-sm relative overflow-hidden group">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between mb-8 gap-4">
             <div>
-              <h3 className="text-xs font-black text-text-strong uppercase tracking-[0.2em]">Network Performance Matrix</h3>
-              <p className="text-[11px] text-text-muted mt-1 font-bold">Deep packet inspection & jitter correlation</p>
+              <h3 className="text-xs font-black text-text-strong uppercase tracking-[0.2em]">
+                Interface Telemetry Stream
+              </h3>
+              <p className="text-[10px] text-text-muted mt-1 font-bold uppercase tracking-tight">
+                Average latency &amp; jitter across all interfaces
+              </p>
             </div>
-            <div className="flex items-center bg-canvas/50 p-1.5 rounded-lg border border-outline-variant/20">
-               <button className="px-3 py-1 text-[9px] font-black uppercase tracking-widest text-text-strong bg-surface-bright rounded-md shadow-sm">Real-time</button>
-               <button className="px-3 py-1 text-[9px] font-black uppercase tracking-widest text-text-muted hover:text-text-strong transition-colors">Historical</button>
+            <div className="flex items-center space-x-2 bg-canvas/30 p-1 rounded-lg border border-outline-variant/20">
+              <div className="flex items-center space-x-2 px-3 py-1 bg-surface-bright rounded text-[9px] font-black text-text-strong uppercase tracking-widest">
+                <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></span>
+                <span>Live</span>
+              </div>
             </div>
           </div>
-          <div className="h-[320px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={performanceData}>
-                <defs>
-                  <linearGradient id="colorLat" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#ffffff" stopOpacity={0.15}/>
-                    <stop offset="95%" stopColor="#ffffff" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} opacity={0.2} />
-                <XAxis 
-                  dataKey="time" 
-                  axisLine={false} 
-                  tickLine={false} 
-                  tick={{fill: '#94a3b8', fontSize: 10, fontWeight: 700}} 
-                  dy={10}
-                />
-                <YAxis 
-                  axisLine={false} 
-                  tickLine={false} 
-                  tick={{fill: '#94a3b8', fontSize: 10, fontWeight: 700}} 
-                />
-                <Tooltip 
-                  contentStyle={{backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '8px', fontSize: '11px', boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)'}}
-                  itemStyle={{color: '#f8fafc', fontWeight: 700}}
-                />
-                <Area type="monotone" dataKey="latency" stroke="#ffffff" strokeWidth={3} fillOpacity={1} fill="url(#colorLat)" />
-                <Line type="monotone" dataKey="jitter" stroke="#38bdf8" strokeWidth={2} dot={{r: 4, fill: '#38bdf8', strokeWidth: 2, stroke: '#0f172a'}} />
-              </AreaChart>
-            </ResponsiveContainer>
+          <div className="h-[300px] w-full">
+            {telemetryData.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-text-muted text-xs font-bold uppercase tracking-widest">
+                No data yet — awaiting first probe cycle
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={telemetryData}>
+                  <defs>
+                    <linearGradient id="colorLat" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#ffffff" stopOpacity={0.15} />
+                      <stop offset="95%" stopColor="#ffffff" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} opacity={0.1} />
+                  <XAxis dataKey="time" axisLine={false} tickLine={false} tick={{ fill: "#94a3b8", fontSize: 9, fontWeight: 900 }} dy={10} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fill: "#94a3b8", fontSize: 9, fontWeight: 900 }} unit="ms" />
+                  <Tooltip
+                    contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155", borderRadius: "12px", fontSize: "10px", boxShadow: "0 20px 25px -5px rgba(0,0,0,0.2)", padding: "12px" }}
+                    itemStyle={{ color: "#f8fafc", fontWeight: 900, textTransform: "uppercase" }}
+                    labelStyle={{ color: "#94a3b8", marginBottom: "8px", fontWeight: 900 }}
+                  />
+                  <Area type="monotone" dataKey="latency" name="Latency" stroke="#ffffff" strokeWidth={3} fillOpacity={1} fill="url(#colorLat)" dot={false} activeDot={{ r: 6, fill: "#ffffff", strokeWidth: 4, stroke: "#020617" }} />
+                  <Line type="monotone" dataKey="jitter" name="Jitter" stroke="#38bdf8" strokeWidth={2} dot={false} activeDot={{ r: 4, fill: "#38bdf8" }} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </div>
 
-        {/* Traffic Distribution */}
-        <div className="bg-surface-container-low p-8 rounded-2xl border border-outline-variant/20 shadow-sm flex flex-col">
-          <h3 className="text-xs font-black text-text-strong uppercase tracking-[0.2em] mb-10">Application Load</h3>
+        {/* Interface Score Breakdown Pie */}
+        <div className="bg-surface-container-low p-6 rounded-2xl border border-outline-variant/20 shadow-sm flex flex-col group">
+          <h3 className="text-xs font-black text-text-strong uppercase tracking-[0.2em] mb-8">
+            Interface Score Breakdown
+          </h3>
           <div className="flex-1 flex items-center justify-center relative">
-            <ResponsiveContainer width="100%" height={240}>
-              <PieChart>
-                <Pie
-                  data={trafficData}
-                  cx="50%"
-                  cy="50%"
-                  innerRadius={75}
-                  outerRadius={100}
-                  paddingAngle={8}
-                  dataKey="value"
-                  stroke="none"
-                >
-                  {trafficData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={entry.color} />
-                  ))}
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
-            <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-              <span className="text-4xl font-black text-text-strong tracking-tighter">1.2</span>
-              <span className="text-[10px] text-text-muted uppercase font-black tracking-widest">Gbps Total</span>
-            </div>
+            {scorePieData.length === 0 ? (
+              <div className="text-text-muted text-xs font-bold uppercase tracking-widest text-center">
+                No interfaces configured
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height={220}>
+                <PieChart>
+                  <Pie data={scorePieData} cx="50%" cy="50%" innerRadius={70} outerRadius={90} paddingAngle={10} dataKey="value" stroke="none">
+                    {scorePieData.map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={entry.color} className="hover:opacity-80 transition-opacity cursor-pointer" />
+                    ))}
+                  </Pie>
+                  <Tooltip
+                    contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155", borderRadius: "8px", fontSize: "10px" }}
+                    formatter={(v: any) => [v.toFixed(1), "Score"]}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            )}
+            {scorePieData.length > 0 && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                <span className="text-3xl font-black text-text-strong tracking-tighter">{pieAvgScore}</span>
+                <span className="text-[9px] text-text-muted uppercase font-black tracking-[0.2em]">Avg Score</span>
+              </div>
+            )}
           </div>
-          <div className="mt-10 grid grid-cols-2 gap-4">
-            {trafficData.map((item) => (
-              <div key={item.name} className="p-3 rounded-xl bg-canvas/40 border border-outline-variant/10 flex flex-col gap-1">
-                <div className="flex items-center space-x-2">
-                  <div className="w-2 h-2 rounded-full" style={{backgroundColor: item.color}}></div>
-                  <span className="text-[10px] font-black uppercase tracking-tight text-text-muted">{item.name}</span>
+          <div className="mt-8 space-y-2">
+            {scorePieData.map((item, i) => (
+              <div key={item.name} className="p-2.5 rounded-xl bg-canvas/30 border border-outline-variant/10 flex items-center justify-between group/item hover:bg-canvas/50 transition-colors">
+                <div className="flex items-center space-x-3">
+                  <div className="w-2 h-2 rounded-full" style={{ backgroundColor: item.color }}></div>
+                  <span className="text-[10px] font-black uppercase tracking-widest text-text-muted group-hover/item:text-text-strong transition-colors">
+                    {item.name}
+                  </span>
                 </div>
-                <span className="text-sm font-black text-text-strong">{Math.round((item.value / 1000) * 100)}%</span>
+                <span className={`text-xs font-black tabular-nums ${item.value > 80 ? "text-success-green" : item.value > 50 ? "text-warning-amber" : "text-error-red"}`}>
+                  {item.value.toFixed(1)}
+                </span>
               </div>
             ))}
           </div>
         </div>
       </div>
 
-      {/* Connection Table */}
+      {/* Interface Health Table — real data from /api/status/interfaces */}
       <div className="bg-surface-container-low rounded-2xl border border-outline-variant/20 shadow-sm overflow-hidden">
-        <div className="px-8 py-6 border-b border-outline-variant/20 flex items-center justify-between bg-surface-bright/5">
-          <div>
-            <h3 className="text-xs font-black text-text-strong uppercase tracking-[0.2em]">Live Traffic Analysis</h3>
-            <p className="text-[10px] text-text-muted mt-1 font-bold">Active interface peering & bandwidth allocation</p>
+        <div className="px-6 py-5 border-b border-outline-variant/20 flex items-center justify-between bg-surface-bright/5">
+          <div className="flex items-center space-x-3">
+            <div className="w-8 h-8 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+              </svg>
+            </div>
+            <div>
+              <h3 className="text-xs font-black text-text-strong uppercase tracking-[0.2em]">WAN Interface Status</h3>
+              <p className="text-[9px] text-text-muted mt-0.5 font-bold uppercase tracking-tight">
+                Live state from controller
+              </p>
+            </div>
           </div>
-          <button className="px-4 py-2 bg-surface-bright/50 border border-outline-variant/30 text-[10px] font-black text-text-strong hover:bg-primary hover:text-primary-on transition-all rounded-lg uppercase tracking-widest">View All Nodes</button>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left">
             <thead>
-              <tr className="bg-canvas/40">
-                <th className="px-8 py-4 text-[10px] font-black text-text-muted uppercase tracking-[0.2em]">Source Node</th>
-                <th className="px-8 py-4 text-[10px] font-black text-text-muted uppercase tracking-[0.2em]">Interface</th>
-                <th className="px-8 py-4 text-[10px] font-black text-text-muted uppercase tracking-[0.2em]">State</th>
-                <th className="px-8 py-4 text-[10px] font-black text-text-muted uppercase tracking-[0.2em] text-right">Throughput</th>
+              <tr className="bg-canvas/20">
+                <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Interface</th>
+                <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">State</th>
+                <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em] text-center">Score</th>
+                <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em]">Gateway</th>
+                <th className="px-6 py-4 text-[9px] font-black text-text-muted uppercase tracking-[0.25em] text-right">Speed</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-outline-variant/10">
-              {[
-                { ip: "192.168.1.105", iface: "WAN1", status: "Active", speed: "12.4 Mbps", load: "High" },
-                { ip: "192.168.1.12", iface: "WAN1", status: "Active", speed: "4.8 Mbps", load: "Med" },
-                { ip: "10.0.0.45", iface: "WAN2", status: "Active", speed: "256 Kbps", load: "Low" },
-                { ip: "192.168.1.201", iface: "WAN1", status: "Idle", speed: "0 Mbps", load: "None" },
-              ].map((conn, idx) => (
-                <tr key={idx} className="hover:bg-primary/[0.02] transition-colors group">
-                  <td className="px-8 py-5">
-                    <div className="flex items-center space-x-3">
-                       <div className="w-8 h-8 rounded-lg bg-surface-bright flex items-center justify-center font-mono text-[10px] font-bold text-text-muted border border-outline-variant/20 group-hover:border-primary/30 transition-colors">IP</div>
-                       <span className="text-xs font-black font-mono text-text-strong">{conn.ip}</span>
-                    </div>
-                  </td>
-                  <td className="px-8 py-5">
-                    <span className="px-2.5 py-1 rounded-md bg-surface-bright/50 border border-outline-variant/30 text-text-strong text-[9px] font-black uppercase tracking-widest">{conn.iface}</span>
-                  </td>
-                  <td className="px-8 py-5">
-                    <div className="flex items-center space-x-2">
-                       <div className={`w-2 h-2 rounded-full ${conn.status === 'Active' ? 'bg-success-green shadow-[0_0_8px_rgba(74,222,128,0.4)]' : 'bg-outline-variant'}`}></div>
-                       <span className="text-[10px] font-black uppercase tracking-wider text-text-muted">{conn.status}</span>
-                    </div>
-                  </td>
-                  <td className="px-8 py-5 text-right">
-                    <div className="flex flex-col items-end">
-                      <span className="text-xs font-black text-text-strong tracking-tight tabular-nums">{conn.speed}</span>
-                      <div className="w-16 h-1 bg-outline-variant/20 rounded-full mt-1.5 overflow-hidden">
-                         <div className={`h-full rounded-full ${conn.load === 'High' ? 'bg-error-red w-3/4' : conn.load === 'Med' ? 'bg-warning-amber w-1/2' : 'bg-success-green w-1/4'}`}></div>
-                      </div>
-                    </div>
+              {ifaceStatus.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="px-6 py-12 text-center text-text-muted text-xs font-bold uppercase tracking-widest">
+                    Loading interface data…
                   </td>
                 </tr>
-              ))}
+              ) : (
+                ifaceStatus.map((iface) => (
+                  <tr key={iface.name} className="hover:bg-primary/[0.02] transition-colors group">
+                    <td className="px-6 py-5">
+                      <div className="flex items-center space-x-4">
+                        <div className="w-9 h-9 rounded-xl bg-surface-bright flex items-center justify-center font-mono text-[10px] font-black text-text-muted border border-outline-variant/20 group-hover:border-primary/30 transition-colors uppercase">
+                          {iface.name.slice(0, 4)}
+                        </div>
+                        <div className="flex flex-col">
+                          <span className="text-xs font-black text-text-strong uppercase tracking-wide">
+                            {iface.label}
+                          </span>
+                          <span className="text-[9px] font-mono text-text-muted">{iface.name}</span>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-6 py-5">
+                      <div className="flex items-center space-x-2.5">
+                        <div className={`w-2 h-2 rounded-full ${iface.wan_state === "STABLE" ? "bg-success-green shadow-[0_0_10px_rgba(74,222,128,0.5)]" : iface.wan_state === "DEGRADED" ? "bg-warning-amber" : "bg-error-red shadow-[0_0_10px_rgba(248,113,113,0.5)]"}`}></div>
+                        <div className="flex flex-col">
+                          <span className="text-[10px] font-black uppercase tracking-widest text-text-strong">
+                            {iface.wan_state ?? "Unknown"}
+                          </span>
+                          <span className="text-[8px] font-bold text-text-muted uppercase">
+                            {iface.in_pool ? "In Pool" : "Out of Pool"}
+                          </span>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-6 py-5 text-center">
+                      <span className={`text-sm font-black tabular-nums ${(iface.score ?? 0) > 80 ? "text-success-green" : (iface.score ?? 0) > 50 ? "text-warning-amber" : "text-error-red"}`}>
+                        {iface.score?.toFixed(1) ?? "—"}
+                      </span>
+                    </td>
+                    <td className="px-6 py-5">
+                      <span className="text-xs font-mono text-text-muted">{iface.gateway}</span>
+                    </td>
+                    <td className="px-6 py-5 text-right">
+                      <div className="flex flex-col items-end">
+                        <span className="text-xs font-black text-text-strong tracking-tight tabular-nums">
+                          {iface.expected_speed_mbps} Mbps
+                        </span>
+                        <div className="w-16 h-1 bg-outline-variant/10 rounded-full mt-2 overflow-hidden">
+                          <div
+                            className={`h-full rounded-full transition-all duration-1000 ${(iface.score ?? 0) > 80 ? "bg-success-green w-full" : (iface.score ?? 0) > 50 ? "bg-warning-amber w-2/3" : "bg-error-red w-1/3"}`}
+                          ></div>
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

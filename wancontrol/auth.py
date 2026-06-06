@@ -81,6 +81,7 @@ class UserPrincipal:
     username: str
     role: str    # "admin" | "operator" | "viewer"
     source: str  # "jwt" | "session" | "api_token"
+    requires_password_change: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,7 @@ class TokenPair:
     access_token: str  # signed JWT
     token_type: str    # always "bearer"
     expires_in: int    # seconds until expiry
+    requires_password_change: bool = False
 
 
 # ── Auth class ────────────────────────────────────────────────────────────────
@@ -137,6 +139,7 @@ class Auth:
         password: str,
         role: str,
         created_by_user_id: int | None = None,
+        requires_password_change: bool = False,
     ) -> int:
         """
         Hash *password* with bcrypt and create a new user in the database.
@@ -160,7 +163,7 @@ class Auth:
             )
 
         password_hash = self._hash_password(password)
-        user_id = self._db.create_user(username, password_hash, role)
+        user_id = self._db.create_user(username, password_hash, role, requires_password_change)
         self._db.log_event(
             level="INFO",
             component="auth",
@@ -237,6 +240,7 @@ class Auth:
             )
 
         self._db.update_user_password(user_id, self._hash_password(new_password))
+        self._db.set_requires_password_change(user_id, False)
         logger.info(
             "Password changed for user_id=%d.", user_id,
             extra={"component": "auth"},
@@ -327,7 +331,7 @@ class Auth:
             return
 
         password = secrets.token_urlsafe(12)
-        self.create_user("admin", password, "admin")
+        self.create_user("admin", password, "admin", requires_password_change=True)
         self._db.log_event(
             level="WARNING",
             component="auth",
@@ -359,6 +363,7 @@ class Auth:
             "role": user.role,
             "iat": now,
             "exp": now + expiry_seconds,
+            "rpc": int(user.requires_password_change),
         }
         token = pyjwt.encode(
             payload,
@@ -369,6 +374,7 @@ class Auth:
             access_token=token,
             token_type="bearer",
             expires_in=expiry_seconds,
+            requires_password_change=user.requires_password_change,
         )
 
     def verify_token(self, token: str) -> UserPrincipal:
@@ -405,6 +411,7 @@ class Auth:
             username=payload["username"],
             role=payload["role"],
             source="jwt",
+            requires_password_change=bool(payload.get("rpc", 0)),
         )
 
     # ── API tokens ─────────────────────────────────────────────────────────
@@ -474,6 +481,7 @@ class Auth:
             username=user.username,
             role=user.role,
             source="api_token",
+            requires_password_change=user.requires_password_change,
         )
 
     def revoke_api_token(self, token_id: int, revoked_by_user_id: int) -> None:

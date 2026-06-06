@@ -12,7 +12,14 @@ Group=wancontrol
 EnvironmentFile=-/etc/wancontrol/.env
 Environment=WANCONTROL_CONFIG=/etc/wancontrol/config.yaml
 WorkingDirectory=/opt/wancontrol
+# The --wait-for-network readiness gate polls up to 120s; systemd's default
+# TimeoutStartSec is 90s, which would kill the unit mid-gate on a slow link.
+# Give startup more than the gate window plus margin.
+TimeoutStartSec=180
+ExecStartPre=/opt/wancontrol/venv/bin/python -m wancontrol --wait-for-network
 ExecStart=/opt/wancontrol/venv/bin/python -m wancontrol
+ExecStop=/opt/wancontrol/venv/bin/python /opt/wancontrol/wancontrol/network.py --restore-routes
+ExecStopPost=/opt/wancontrol/venv/bin/python /opt/wancontrol/wancontrol/network.py --restore-routes
 Restart=on-failure
 RestartSec=10
 StartLimitIntervalSec=60
@@ -24,7 +31,8 @@ PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/wancontrol /etc/wancontrol /run/wancontrol
-CapabilityBoundingSet=
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=wancontrol

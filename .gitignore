@@ -80,5 +80,8 @@ yarn-error.log*
 # Project specific
 artifacts/
 .claude/
+scratch/
+frontend/dist_app/
+frontend/dist_dev/
 
 ```
