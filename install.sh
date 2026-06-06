@@ -116,6 +116,12 @@ PY
         sed -i "s/REPLACE_ME_run_python_secrets_token_hex_32/$SECRET/" /etc/wancontrol/config.yaml || true
         sed -i "s/CHANGE_THIS_TO_A_RANDOM_STRING_MIN_32_CHARS/$SECRET/" /etc/wancontrol/config.yaml || true
     fi
+    # The config is created here (as root) AFTER the dir-wide chown above, so it
+    # would otherwise stay root-owned and the wancontrol service could not save
+    # edits made from the dashboard (PUT /api/config/interfaces -> EACCES 500).
+    # Hand it to the service user and restrict perms (it holds server.secret_key).
+    run chown wancontrol:wancontrol /etc/wancontrol/config.yaml
+    run chmod 0640 /etc/wancontrol/config.yaml
     echo "Config written to /etc/wancontrol/config.yaml — edit interfaces and gateways before starting."
 else
     echo "Config already exists at /etc/wancontrol/config.yaml — skipping."
