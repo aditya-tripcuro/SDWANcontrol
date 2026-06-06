@@ -1,4 +1,4 @@
-import type { InterfaceStatus } from "./types";
+import type { InterfaceStatus, ControllerStatus } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -136,4 +136,12 @@ export async function getControllerEvents(limit = 100, level?: string): Promise<
   const params = new URLSearchParams({ limit: limit.toString() });
   if (level) params.append("level", level);
   return apiFetch<any[]>(`/api/events/controller?${params}`);
+}
+
+// Controller lifecycle actions. All require operator role and return the updated
+// controller status. See /api/control/* in app.py.
+export type ControlAction = "start" | "pause" | "resume" | "stop" | "kill";
+
+export async function controlAction(action: ControlAction): Promise<ControllerStatus> {
+  return apiFetch<ControllerStatus>(`/api/control/${action}`, { method: "POST" });
 }

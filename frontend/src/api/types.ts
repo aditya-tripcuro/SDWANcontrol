@@ -10,7 +10,7 @@ export interface InterfaceStatus {
 }
 
 export interface ControllerStatus {
-  mode: 'STARTING' | 'RUNNING' | 'MAINTENANCE' | 'KILLED'
+  mode: 'STOPPED' | 'STARTING' | 'RUNNING' | 'PAUSED' | 'KILLED'
   wan_mode: 'failover' | 'load_balance'
   active_interface: string | null
   nexthop_pool: string[]

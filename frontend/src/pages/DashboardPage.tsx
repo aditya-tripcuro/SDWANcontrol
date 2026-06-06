@@ -15,10 +15,98 @@ import {
   Pie,
   Cell,
 } from "recharts";
-import { getStatus, getMetrics, getInterfacesStatus } from "../api/client";
+import { getStatus, getMetrics, getInterfacesStatus, controlAction, type ControlAction } from "../api/client";
 import type { InterfaceStatus } from "../api/types";
+import { useAuth } from "../auth/AuthContext";
 
 const IFACE_COLORS = ["#ffffff", "#38bdf8", "#4ade80", "#fbbf24", "#f87171", "#a78bfa"];
+
+const CONTROL_MODE_STYLE: Record<string, string> = {
+  RUNNING: "text-success-green",
+  PAUSED: "text-warning-amber",
+  STARTING: "text-warning-amber",
+  STOPPED: "text-text-muted",
+  KILLED: "text-error-red",
+};
+
+// Route-management controls (Start / Pause / Resume / Stop). Wired to the
+// /api/control/* endpoints, which require operator role; viewers see state only.
+const ControllerControls: React.FC<{ mode?: string; onStatus: (s: any) => void }> = ({ mode, onStatus }) => {
+  const { user } = useAuth();
+  const canControl = user?.role === "admin" || user?.role === "operator";
+  const [busy, setBusy] = useState<ControlAction | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const run = async (action: ControlAction) => {
+    setBusy(action);
+    setErr(null);
+    try {
+      onStatus(await controlAction(action));
+    } catch (e: any) {
+      setErr(e?.message || "Action failed");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const Btn: React.FC<{ action: ControlAction; label: string; intent: "primary" | "neutral" | "danger" }> = ({
+    action,
+    label,
+    intent,
+  }) => {
+    const styles =
+      intent === "primary"
+        ? "bg-primary text-primary-on border-primary/50 hover:shadow-lg hover:shadow-white/10"
+        : intent === "danger"
+        ? "bg-error-red/10 text-error-red border-error-red/40 hover:bg-error-red/20"
+        : "bg-surface-bright text-text-strong border-outline-variant/30 hover:border-primary/40";
+    return (
+      <button
+        type="button"
+        disabled={busy !== null}
+        onClick={() => run(action)}
+        className={`px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest border transition-all disabled:opacity-40 disabled:cursor-not-allowed ${styles}`}
+      >
+        {busy === action ? "…" : label}
+      </button>
+    );
+  };
+
+  return (
+    <div className="flex flex-col items-end gap-2">
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] font-black text-text-muted uppercase tracking-widest">Routing</span>
+        <span className={`text-[10px] font-black uppercase tracking-widest ${CONTROL_MODE_STYLE[mode ?? ""] ?? "text-text-muted"}`}>
+          {mode ?? "…"}
+        </span>
+      </div>
+      {!canControl ? (
+        <span className="text-[9px] font-bold text-text-muted uppercase tracking-wide">Operator role required</span>
+      ) : mode === "STARTING" ? (
+        <span className="text-[10px] font-black text-warning-amber uppercase tracking-widest animate-pulse">Starting…</span>
+      ) : (
+        <div className="flex items-center gap-2">
+          {mode === "RUNNING" && (
+            <>
+              <Btn action="pause" label="Pause" intent="neutral" />
+              <Btn action="stop" label="Stop" intent="danger" />
+            </>
+          )}
+          {mode === "PAUSED" && (
+            <>
+              <Btn action="resume" label="Resume" intent="primary" />
+              <Btn action="stop" label="Stop" intent="danger" />
+            </>
+          )}
+          {(mode === undefined || mode === "STOPPED" || mode === "KILLED") && (
+            <Btn action="start" label="Start" intent="primary" />
+          )}
+        </div>
+      )}
+      {err && <span className="text-[9px] font-bold text-error-red uppercase tracking-wide max-w-[14rem] text-right">{err}</span>}
+    </div>
+  );
+};
 
 const DashboardPage: React.FC = () => {
   const [status, setStatus] = useState<any>(null);
@@ -179,12 +267,13 @@ const DashboardPage: React.FC = () => {
               {totalLinks > 0 ? `${activeLinks} / ${totalLinks}` : "—"}
             </span>
           </div>
-          <div className="flex flex-col items-end">
+          <div className="flex flex-col items-end border-r border-outline-variant/30 pr-6">
             <span className="text-[10px] font-black text-text-muted uppercase tracking-widest">Global Score</span>
             <span className={`text-lg font-black ${parseFloat(globalScore) > 80 ? "text-success-green" : parseFloat(globalScore) > 50 ? "text-warning-amber" : "text-error-red"}`}>
               {totalLinks > 0 ? globalScore : "—"}
             </span>
           </div>
+          <ControllerControls mode={status?.mode} onStatus={setStatus} />
         </div>
       </div>
 
