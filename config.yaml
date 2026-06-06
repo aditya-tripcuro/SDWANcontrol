@@ -87,6 +87,30 @@ retention:
   metrics_hours: 72
   events_days: 30
   prune_interval_min: 60
+  # New tables introduced for usage graphs and speedtest history.
+  usage_hours: 336        # 14 days of rx/tx samples
+  speedtest_days: 90      # sparse rows; keep longer
+
+# ── Usage sampling (rx/tx throughput per interface) ───────────────────────────
+# Reads /proc/net/dev counters and persists Mbps so the UI can render a
+# Windows-Task-Manager-style chart. Cheap; safe to leave on.
+usage:
+  enabled: true
+  sample_interval_sec: 5
+
+# ── Speedtest (Ookla CLI) ─────────────────────────────────────────────────────
+# OFF by default. Toggle per interface from the UI (Metrics page) or list them
+# under enabled_interfaces here. Requires the Ookla `speedtest` binary on PATH;
+# if it's missing the runner stays idle (graceful no-op).
+#   - binary_path: explicit path; empty = auto-detect via shutil.which("speedtest")
+#   - interval_sec: minimum gap between automatic runs per interface
+#   - run_timeout_sec: hard timeout for one CLI invocation
+speedtest:
+  enabled: false
+  interval_sec: 3600
+  binary_path: ""
+  enabled_interfaces: []
+  run_timeout_sec: 120
 
 # ── Alerting ──────────────────────────────────────────────────────────────────
 alerting:

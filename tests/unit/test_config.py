@@ -434,3 +434,48 @@ class TestThreadSafety:
         first = results[0]
         for r in results[1:]:
             assert r is first, "Threads got different AppConfig objects"
+
+
+# ── Speedtest + Usage blocks ──────────────────────────────────────────────────
+
+class TestSpeedtestUsageBlocks:
+    def test_speedtest_block_absent_yields_disabled_defaults(self, tmp_path: Path) -> None:
+        # _minimal_dict has no speedtest/usage keys at all.
+        cfg = Config(_write(tmp_path, _minimal_dict())).load()
+        assert cfg.speedtest.enabled is False
+        assert cfg.speedtest.interval_sec == 3600
+        assert cfg.speedtest.enabled_interfaces == ()
+        assert cfg.usage.enabled is True
+        assert cfg.usage.sample_interval_sec == 5
+
+    def test_speedtest_block_parsed_from_yaml(self, tmp_path: Path) -> None:
+        data = _minimal_dict()
+        data["speedtest"] = {
+            "enabled": True,
+            "interval_sec": 1800,
+            "binary_path": "/opt/bin/speedtest",
+            "enabled_interfaces": ["wan0"],
+            "run_timeout_sec": 90,
+        }
+        data["usage"] = {"enabled": False, "sample_interval_sec": 10}
+        cfg = Config(_write(tmp_path, data)).load()
+        assert cfg.speedtest.enabled is True
+        assert cfg.speedtest.interval_sec == 1800
+        assert cfg.speedtest.binary_path == "/opt/bin/speedtest"
+        assert cfg.speedtest.enabled_interfaces == ("wan0",)
+        assert cfg.speedtest.run_timeout_sec == 90
+        assert cfg.usage.enabled is False
+        assert cfg.usage.sample_interval_sec == 10
+
+    def test_speedtest_enabled_interfaces_must_be_list(self, tmp_path: Path) -> None:
+        data = _minimal_dict()
+        data["speedtest"] = {"enabled_interfaces": "wan0"}  # wrong type
+        with pytest.raises(ConfigError, match="enabled_interfaces"):
+            Config(_write(tmp_path, data)).load()
+
+    def test_retention_speedtest_usage_optional(self, tmp_path: Path) -> None:
+        data = _minimal_dict()
+        # retention block has no usage_hours/speedtest_days — should default.
+        cfg = Config(_write(tmp_path, data)).load()
+        assert cfg.retention.usage_hours == 336
+        assert cfg.retention.speedtest_days == 90

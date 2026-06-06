@@ -91,5 +91,31 @@ export interface DbStats {
   controller_events_count: number
   alerts_count: number
   users_count: number
+  speedtest_count: number
+  usage_count: number
   schema_version: number
+}
+
+export interface SpeedtestResult {
+  id: number
+  interface: string
+  timestamp: number
+  download_mbps: number | null
+  upload_mbps: number | null
+  ping_ms: number | null
+  jitter_ms: number | null
+  packet_loss_pct: number | null
+  server_name: string | null
+  isp: string | null
+  error: string | null
+}
+
+export interface UsageSample {
+  id: number
+  interface: string
+  timestamp: number
+  rx_mbps: number
+  tx_mbps: number
+  rx_bytes_total: number
+  tx_bytes_total: number
 }

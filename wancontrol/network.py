@@ -13,9 +13,12 @@ import json
 import ipaddress
 import logging
 import os
+import random
 import shutil
 import socket
 import subprocess
+import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from wancontrol.config import InterfaceConfig, Config
@@ -307,6 +310,172 @@ def probe_http(interface: str, target: str, timeout_sec: int = 2) -> tuple[bool,
         return False, 0.0
     except Exception:
         return False, 0.0
+
+
+# ── Interface byte counters (for usage graph) ─────────────────────────────────
+
+def read_interface_counters(interface: str) -> tuple[int, int, int, int] | None:
+    """
+    Read cumulative rx/tx byte and packet counters for one interface.
+
+    Returns (rx_bytes, tx_bytes, rx_pkts, tx_pkts) or None if the interface
+    is not present in /proc/net/dev. WANCONTROL_DRY_RUN returns synthetic
+    monotonically-increasing values seeded by interface name so unit tests and
+    dev mode see plausible rates without touching the kernel.
+    """
+    if _dry_run_enabled():
+        seed = abs(hash(interface)) & 0xFFFF
+        rx = (int(time.monotonic() * (1_000_000 + seed)) & 0xFFFFFFFFFFFF)
+        tx = (int(time.monotonic() * (500_000 + seed)) & 0xFFFFFFFFFFFF)
+        return rx, tx, rx // 1500, tx // 1500
+    try:
+        with open("/proc/net/dev", "r", encoding="utf-8") as fh:
+            for line in fh:
+                # Format: "  eth0: 12345 678 0 0 0 0 0 0    9012 34 0 0 0 0 0 0"
+                if ":" not in line:
+                    continue
+                name, rest = line.split(":", 1)
+                if name.strip() != interface:
+                    continue
+                fields = rest.split()
+                if len(fields) < 16:
+                    return None
+                return (
+                    int(fields[0]),   # rx_bytes
+                    int(fields[8]),   # tx_bytes
+                    int(fields[1]),   # rx_packets
+                    int(fields[9]),   # tx_packets
+                )
+    except OSError as exc:
+        logger.warning(
+            "Could not read /proc/net/dev: %s", exc,
+            extra={"component": "network"},
+        )
+        return None
+    return None
+
+
+# ── Speedtest (Ookla CLI) ─────────────────────────────────────────────────────
+
+@dataclass
+class SpeedtestResult:
+    """Outcome of one Ookla speedtest run. error is None on success."""
+    download_mbps: float | None
+    upload_mbps: float | None
+    ping_ms: float | None
+    jitter_ms: float | None
+    packet_loss_pct: float | None
+    server_name: str | None
+    isp: str | None
+    error: str | None
+
+
+def _resolve_speedtest_binary(configured_path: str) -> str | None:
+    """Pick the speedtest binary: explicit config wins, else `which speedtest`."""
+    if configured_path:
+        return configured_path if os.path.isfile(configured_path) else None
+    return shutil.which("speedtest")
+
+
+def run_speedtest(
+    interface: str,
+    binary_path: str = "",
+    timeout_sec: int = 120,
+) -> SpeedtestResult:
+    """
+    Run the Ookla speedtest CLI bound to an interface and parse the JSON result.
+
+    Returns a SpeedtestResult with all fields populated on success. On any
+    failure (binary missing, interface down, network error, JSON parse error)
+    the numeric fields are None and ``error`` carries a short message — the
+    row is still inserted so the UI can show "last run failed at HH:MM" instead
+    of looking stuck.
+    """
+    if _dry_run_enabled():
+        # Synthetic, but plausible. Stable enough to exercise the UI; varies
+        # per call so a chart shows movement.
+        base = abs(hash(interface)) % 50 + 50  # 50–100 Mbps baseline
+        return SpeedtestResult(
+            download_mbps=float(base + random.random() * 20),
+            upload_mbps=float(base / 2 + random.random() * 10),
+            ping_ms=float(random.uniform(5, 30)),
+            jitter_ms=float(random.uniform(0.5, 3.0)),
+            packet_loss_pct=0.0,
+            server_name=f"dry-run-server-{interface}",
+            isp="DryRunISP",
+            error=None,
+        )
+
+    binary = _resolve_speedtest_binary(binary_path)
+    if not binary:
+        return SpeedtestResult(
+            None, None, None, None, None, None, None,
+            error="speedtest binary not found",
+        )
+
+    cmd = [
+        binary,
+        "--interface", interface,
+        "--format=json",
+        "--accept-license",
+        "--accept-gdpr",
+    ]
+    try:
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        return SpeedtestResult(
+            None, None, None, None, None, None, None,
+            error=f"timed out after {timeout_sec}s",
+        )
+    except OSError as exc:
+        return SpeedtestResult(
+            None, None, None, None, None, None, None,
+            error=f"could not exec: {exc}",
+        )
+
+    if res.returncode != 0:
+        # Ookla CLI writes JSON to stdout even on most errors; try to extract
+        # a useful message before falling back to stderr.
+        msg = (res.stderr or res.stdout or "").strip().splitlines()
+        snippet = msg[-1] if msg else f"exit {res.returncode}"
+        return SpeedtestResult(
+            None, None, None, None, None, None, None,
+            error=f"speedtest exit {res.returncode}: {snippet[:160]}",
+        )
+
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        return SpeedtestResult(
+            None, None, None, None, None, None, None,
+            error=f"parse error: {exc}",
+        )
+
+    # Ookla returns bandwidth in BYTES per second.
+    def _mbps(node: dict | None) -> float | None:
+        if not node:
+            return None
+        bw = node.get("bandwidth")
+        if bw is None:
+            return None
+        return float(bw) * 8.0 / 1_000_000.0
+
+    ping = data.get("ping") or {}
+    server = data.get("server") or {}
+    return SpeedtestResult(
+        download_mbps=_mbps(data.get("download")),
+        upload_mbps=_mbps(data.get("upload")),
+        ping_ms=float(ping.get("latency")) if ping.get("latency") is not None else None,
+        jitter_ms=float(ping.get("jitter")) if ping.get("jitter") is not None else None,
+        packet_loss_pct=(
+            float(data["packetLoss"]) if data.get("packetLoss") is not None else None
+        ),
+        server_name=str(server.get("name")) if server.get("name") else None,
+        isp=str(data.get("isp")) if data.get("isp") else None,
+        error=None,
+    )
 
 
 def _show_default_routes(family: str) -> list[dict[str, Any]] | None:

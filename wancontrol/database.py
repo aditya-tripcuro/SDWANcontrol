@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # ── Schema version ────────────────────────────────────────────────────────────
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 # ── Row dataclasses ───────────────────────────────────────────────────────────
 
@@ -117,6 +117,32 @@ class IntendedRouteRow:
 
 
 @dataclass
+class SpeedtestRow:
+    id: int
+    interface: str
+    timestamp: float
+    download_mbps: float | None
+    upload_mbps: float | None
+    ping_ms: float | None
+    jitter_ms: float | None
+    packet_loss_pct: float | None
+    server_name: str | None
+    isp: str | None
+    error: str | None
+
+
+@dataclass
+class UsageRow:
+    id: int
+    interface: str
+    timestamp: float
+    rx_mbps: float
+    tx_mbps: float
+    rx_bytes_total: int
+    tx_bytes_total: int
+
+
+@dataclass
 class DbStats:
     file_size_bytes: int
     metrics_count: int
@@ -124,6 +150,8 @@ class DbStats:
     controller_events_count: int
     alerts_count: int
     users_count: int
+    speedtest_count: int
+    usage_count: int
     schema_version: int
 
 
@@ -163,6 +191,23 @@ def _alert_from_row(r: sqlite3.Row) -> "AlertRow":
 
 def _intended_route_from_row(r: sqlite3.Row) -> "IntendedRouteRow":
     return IntendedRouteRow(id=r[0], ts=r[1], command=r[2])
+
+
+def _speedtest_from_row(r: sqlite3.Row) -> "SpeedtestRow":
+    return SpeedtestRow(
+        id=r[0], interface=r[1], timestamp=r[2],
+        download_mbps=r[3], upload_mbps=r[4], ping_ms=r[5],
+        jitter_ms=r[6], packet_loss_pct=r[7],
+        server_name=r[8], isp=r[9], error=r[10],
+    )
+
+
+def _usage_from_row(r: sqlite3.Row) -> "UsageRow":
+    return UsageRow(
+        id=r[0], interface=r[1], timestamp=r[2],
+        rx_mbps=r[3], tx_mbps=r[4],
+        rx_bytes_total=r[5], tx_bytes_total=r[6],
+    )
 
 
 # ── Migrations ────────────────────────────────────────────────────────────────
@@ -266,6 +311,41 @@ MIGRATIONS: dict[int, str] = {
         );
         CREATE INDEX IF NOT EXISTS idx_intended_routes_ts
             ON intended_routes(ts DESC);
+    """,
+    # Migration 3 — per-interface speedtest history and rx/tx throughput samples.
+    # speedtest_results stores nullable measurements so a failed run (binary
+    # missing, interface down, server unreachable) is still recorded with an
+    # ``error`` string for UI debugging. interface_usage stores derived rates
+    # in Mbps (chart-ready) alongside the cumulative byte counters so a future
+    # data-cap feature can sum from raw deltas without re-deriving.
+    3: """
+        CREATE TABLE IF NOT EXISTS speedtest_results (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            interface       TEXT    NOT NULL,
+            timestamp       REAL    NOT NULL,
+            download_mbps   REAL,
+            upload_mbps     REAL,
+            ping_ms         REAL,
+            jitter_ms       REAL,
+            packet_loss_pct REAL,
+            server_name     TEXT,
+            isp             TEXT,
+            error           TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_speedtest_iface_ts
+            ON speedtest_results(interface, timestamp DESC);
+
+        CREATE TABLE IF NOT EXISTS interface_usage (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            interface       TEXT    NOT NULL,
+            timestamp       REAL    NOT NULL,
+            rx_mbps         REAL    NOT NULL,
+            tx_mbps         REAL    NOT NULL,
+            rx_bytes_total  INTEGER NOT NULL,
+            tx_bytes_total  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_usage_iface_ts
+            ON interface_usage(interface, timestamp DESC);
     """,
 }
 
@@ -733,12 +813,129 @@ class Database:
             ).fetchall()
         return [_intended_route_from_row(r) for r in rows]
 
+    # ── Speedtest results ──────────────────────────────────────────────────
+
+    def insert_speedtest(
+        self,
+        interface: str,
+        download_mbps: float | None,
+        upload_mbps: float | None,
+        ping_ms: float | None,
+        jitter_ms: float | None,
+        packet_loss_pct: float | None,
+        server_name: str | None,
+        isp: str | None,
+        error: str | None = None,
+        timestamp: float | None = None,
+    ) -> int:
+        """Insert a speedtest result row (success or failure)."""
+        ts = timestamp or time.time()
+        with self._write_lock, self._conn() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO speedtest_results
+                    (interface, timestamp, download_mbps, upload_mbps, ping_ms,
+                     jitter_ms, packet_loss_pct, server_name, isp, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (interface, ts, download_mbps, upload_mbps, ping_ms,
+                 jitter_ms, packet_loss_pct, server_name, isp, error),
+            )
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def get_speedtests(
+        self,
+        interface: str | None = None,
+        limit: int = 100,
+        since: float | None = None,
+    ) -> list[SpeedtestRow]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if interface:
+            clauses.append("interface = ?")
+            params.append(interface)
+        if since:
+            clauses.append("timestamp >= ?")
+            params.append(since)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, interface, timestamp, download_mbps, upload_mbps, "
+                f"ping_ms, jitter_ms, packet_loss_pct, server_name, isp, error "
+                f"FROM speedtest_results {where} ORDER BY timestamp DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [_speedtest_from_row(r) for r in rows]
+
+    def get_latest_speedtest(self, interface: str) -> SpeedtestRow | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, interface, timestamp, download_mbps, upload_mbps, "
+                "ping_ms, jitter_ms, packet_loss_pct, server_name, isp, error "
+                "FROM speedtest_results WHERE interface = ? "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (interface,),
+            ).fetchone()
+        return _speedtest_from_row(row) if row else None
+
+    # ── Interface usage (rx/tx throughput samples) ─────────────────────────
+
+    def insert_usage(
+        self,
+        interface: str,
+        rx_mbps: float,
+        tx_mbps: float,
+        rx_bytes_total: int,
+        tx_bytes_total: int,
+        timestamp: float | None = None,
+    ) -> None:
+        ts = timestamp or time.time()
+        with self._write_lock, self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO interface_usage
+                    (interface, timestamp, rx_mbps, tx_mbps,
+                     rx_bytes_total, tx_bytes_total)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (interface, ts, rx_mbps, tx_mbps,
+                 rx_bytes_total, tx_bytes_total),
+            )
+
+    def get_usage(
+        self,
+        interface: str | None = None,
+        limit: int = 720,
+        since: float | None = None,
+    ) -> list[UsageRow]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if interface:
+            clauses.append("interface = ?")
+            params.append(interface)
+        if since:
+            clauses.append("timestamp >= ?")
+            params.append(since)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, interface, timestamp, rx_mbps, tx_mbps, "
+                f"rx_bytes_total, tx_bytes_total "
+                f"FROM interface_usage {where} ORDER BY timestamp DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [_usage_from_row(r) for r in rows]
+
     # ── Retention / pruning ────────────────────────────────────────────────
 
     def prune_old_data(
         self,
         metrics_hours: int,
         events_days: int,
+        usage_hours: int = 336,
+        speedtest_days: int = 90,
     ) -> dict[str, int]:
         """
         Delete rows older than retention thresholds.
@@ -747,6 +944,8 @@ class Database:
         now = time.time()
         metrics_cutoff = now - (metrics_hours * 3600)
         events_cutoff = now - (events_days * 86400)
+        usage_cutoff = now - (usage_hours * 3600)
+        speedtest_cutoff = now - (speedtest_days * 86400)
 
         deleted: dict[str, int] = {}
         with self._write_lock, self._conn() as conn:
@@ -771,6 +970,16 @@ class Database:
             )
             deleted["alerts"] = cur.rowcount
 
+            cur = conn.execute(
+                "DELETE FROM interface_usage WHERE timestamp < ?", (usage_cutoff,)
+            )
+            deleted["interface_usage"] = cur.rowcount
+
+            cur = conn.execute(
+                "DELETE FROM speedtest_results WHERE timestamp < ?", (speedtest_cutoff,)
+            )
+            deleted["speedtest_results"] = cur.rowcount
+
         total = sum(deleted.values())
         if total > 0:
             logger.info(
@@ -787,6 +996,8 @@ class Database:
             conn.execute("DELETE FROM controller_events")
             conn.execute("DELETE FROM switch_events")
             conn.execute("DELETE FROM alerts")
+            conn.execute("DELETE FROM interface_usage")
+            conn.execute("DELETE FROM speedtest_results")
         logger.warning("All metrics and events flushed", extra={"component": "database"})
 
     # ── Stats ──────────────────────────────────────────────────────────────
@@ -794,7 +1005,8 @@ class Database:
     def get_db_stats(self) -> DbStats:
         """Return row counts and file size for the dashboard."""
         _TABLES = (
-            "metrics", "switch_events", "controller_events", "alerts", "users"
+            "metrics", "switch_events", "controller_events", "alerts", "users",
+            "speedtest_results", "interface_usage",
         )
         with self._conn() as conn:
             counts = {
@@ -818,6 +1030,8 @@ class Database:
             controller_events_count=counts["controller_events"],
             alerts_count=counts["alerts"],
             users_count=counts["users"],
+            speedtest_count=counts["speedtest_results"],
+            usage_count=counts["interface_usage"],
             schema_version=version,
         )
 

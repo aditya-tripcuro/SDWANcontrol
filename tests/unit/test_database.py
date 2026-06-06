@@ -74,7 +74,8 @@ class TestSetup:
 
     def test_schema_version_after_initialize(self, mem_db: Database) -> None:
         stats = mem_db.get_db_stats()
-        assert stats.schema_version == 2
+        from wancontrol.database import CURRENT_SCHEMA_VERSION
+        assert stats.schema_version == CURRENT_SCHEMA_VERSION
 
     def test_wal_mode_enabled(self, file_db: Database) -> None:
         conn = sqlite3.connect(str(file_db._path))
@@ -493,7 +494,8 @@ class TestStats:
         assert stats.users_count == 1
 
     def test_get_db_stats_schema_version(self, mem_db: Database) -> None:
-        assert mem_db.get_db_stats().schema_version == 2
+        from wancontrol.database import CURRENT_SCHEMA_VERSION
+        assert mem_db.get_db_stats().schema_version == CURRENT_SCHEMA_VERSION
 
     def test_get_db_stats_file_size_bytes_positive(self, file_db: Database) -> None:
         file_db.insert_metric("wan0", 10.0, 1.0, 0.0, True, True, 90.0)

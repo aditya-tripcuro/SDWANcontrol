@@ -1,6 +1,6 @@
 import { apiFetch } from "./client";
 
-type SseEvent = "status" | "alert" | "metric";
+type SseEvent = "status" | "alert" | "metric" | "usage" | "speedtest";
 
 type Callback = (data: unknown) => void;
 
@@ -15,6 +15,8 @@ class SseManager {
     this.callbacks.set("status", new Set());
     this.callbacks.set("alert", new Set());
     this.callbacks.set("metric", new Set());
+    this.callbacks.set("usage", new Set());
+    this.callbacks.set("speedtest", new Set());
   }
 
   get connected(): boolean {
@@ -55,6 +57,8 @@ class SseManager {
     this.es.addEventListener("status", (ev) => this.dispatch("status", this.parse(ev as MessageEvent)));
     this.es.addEventListener("metric", (ev) => this.dispatch("metric", this.parse(ev as MessageEvent)));
     this.es.addEventListener("alert", (ev) => this.dispatch("alert", this.parse(ev as MessageEvent)));
+    this.es.addEventListener("usage", (ev) => this.dispatch("usage", this.parse(ev as MessageEvent)));
+    this.es.addEventListener("speedtest", (ev) => this.dispatch("speedtest", this.parse(ev as MessageEvent)));
   }
 
   private scheduleReconnect(retryId: number): void {

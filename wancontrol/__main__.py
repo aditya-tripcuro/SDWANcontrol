@@ -63,6 +63,8 @@ from wancontrol.controller import Controller
 from wancontrol.database import Database
 from wancontrol.logging_config import setup_logging
 from wancontrol.network import _show_default_routes, check_prerequisites
+from wancontrol.speedtest import SpeedtestRunner
+from wancontrol.usage import UsageSampler
 from wancontrol.watchdog import Watchdog
 
 
@@ -290,6 +292,8 @@ def main() -> int:
 
     controller = Controller(cfg, db)
     watchdog = Watchdog(cfg, db, controller)
+    usage_sampler = UsageSampler(cfg, db)
+    speedtest_runner = SpeedtestRunner(cfg, db)
 
     # Holder for the waitress server; populated just before we serve. The
     # SIGTERM/SIGINT handler closes it so server.run() returns and the process
@@ -307,6 +311,8 @@ def main() -> int:
         )
         controller.shutdown()
         watchdog.stop()
+        speedtest_runner.stop()
+        usage_sampler.stop()
         # Close the waitress server so server.run() returns and main() exits
         # (item 27 — waitress does not self-terminate on SIGTERM).
         server = server_holder.get("server")
@@ -331,6 +337,8 @@ def main() -> int:
     # ── Start Background Tasks ────────────────────────────────────────────
 
     watchdog.start()
+    usage_sampler.start()
+    speedtest_runner.start()
 
     if cfg.controller.auto_start:
         controller.start()
@@ -341,7 +349,11 @@ def main() -> int:
 
     # ── Start Web Server ──────────────────────────────────────────────────
 
-    app = create_app(cfg, cfg_loader, db, controller)
+    app = create_app(
+        cfg, cfg_loader, db, controller,
+        usage_sampler=usage_sampler,
+        speedtest_runner=speedtest_runner,
+    )
 
     def _sync_app_config(new_cfg: AppConfig) -> None:
         effective_cfg = _apply_env_overrides(new_cfg)
@@ -353,6 +365,8 @@ def main() -> int:
         wd_update = getattr(watchdog, "update_config", None)
         if callable(wd_update):
             wd_update(effective_cfg)
+        usage_sampler.update_config(effective_cfg)
+        speedtest_runner.update_config(effective_cfg)
 
     cfg_loader.on_reload(_sync_app_config)
 

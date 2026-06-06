@@ -1,4 +1,9 @@
-import type { InterfaceStatus, ControllerStatus } from "./types";
+import type {
+  InterfaceStatus,
+  ControllerStatus,
+  SpeedtestResult,
+  UsageSample,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -144,4 +149,54 @@ export type ControlAction = "start" | "pause" | "resume" | "stop" | "kill";
 
 export async function controlAction(action: ControlAction): Promise<ControllerStatus> {
   return apiFetch<ControllerStatus>(`/api/control/${action}`, { method: "POST" });
+}
+
+// ── Speedtest ────────────────────────────────────────────────────────────────
+
+export async function getSpeedtests(params?: { interface?: string; limit?: number; since?: number }): Promise<SpeedtestResult[]> {
+  const query = new URLSearchParams();
+  if (params?.interface) query.append("interface", params.interface);
+  if (params?.limit) query.append("limit", params.limit.toString());
+  if (params?.since) query.append("since", params.since.toString());
+  const qs = query.toString();
+  return apiFetch<SpeedtestResult[]>(`/api/speedtest${qs ? `?${qs}` : ""}`);
+}
+
+export async function getLatestSpeedtests(): Promise<Record<string, SpeedtestResult | null>> {
+  return apiFetch<Record<string, SpeedtestResult | null>>("/api/speedtest/latest");
+}
+
+export async function getSpeedtestEnabled(): Promise<Record<string, boolean>> {
+  return apiFetch<Record<string, boolean>>("/api/speedtest/enabled");
+}
+
+export async function setSpeedtestEnabled(iface: string, enabled: boolean): Promise<{
+  interface: string;
+  enabled: boolean;
+  enabled_set: string[];
+}> {
+  return apiFetch("/api/speedtest/enabled", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ interface: iface, enabled }),
+  });
+}
+
+export async function runSpeedtest(iface: string): Promise<{ queued: boolean; interface: string }> {
+  return apiFetch("/api/speedtest/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ interface: iface }),
+  });
+}
+
+// ── Usage ────────────────────────────────────────────────────────────────────
+
+export async function getUsage(params?: { interface?: string; limit?: number; since?: number }): Promise<UsageSample[]> {
+  const query = new URLSearchParams();
+  if (params?.interface) query.append("interface", params.interface);
+  if (params?.limit) query.append("limit", params.limit.toString());
+  if (params?.since) query.append("since", params.since.toString());
+  const qs = query.toString();
+  return apiFetch<UsageSample[]>(`/api/usage${qs ? `?${qs}` : ""}`);
 }

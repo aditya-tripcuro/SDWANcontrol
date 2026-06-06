@@ -394,8 +394,9 @@ def test_config_reload_as_operator_returns_200(seeded_client, operator_token):
 
 
 def test_db_stats_as_admin_returns_200(seeded_client, admin_token):
+    from wancontrol.database import CURRENT_SCHEMA_VERSION
     r = seeded_client.get("/api/db/stats", headers=auth_headers(admin_token))
-    assert r.status_code == 200 and r.get_json().get("schema_version") == 2
+    assert r.status_code == 200 and r.get_json().get("schema_version") == CURRENT_SCHEMA_VERSION
 
 
 def test_nonexistent_route_returns_404_json_with_error_key(client):
@@ -946,9 +947,10 @@ def test_config_reload(client: Any) -> None:
 # ── DATABASE ───────────────────────────────────────────────────────────────────
 
 def test_db_stats_schema_version(client: Any) -> None:
+    from wancontrol.database import CURRENT_SCHEMA_VERSION
     resp = client.get("/api/db/stats", headers=admin_hdrs(client))
     assert resp.status_code == 200
-    assert resp.get_json()["schema_version"] == 2
+    assert resp.get_json()["schema_version"] == CURRENT_SCHEMA_VERSION
 
 
 def test_db_prune(client: Any) -> None:

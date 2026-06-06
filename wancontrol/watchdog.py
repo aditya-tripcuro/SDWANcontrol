@@ -516,15 +516,20 @@ class Watchdog:
         retention = getattr(cfg, "retention", None)
         metrics_hours = getattr(retention, "metrics_hours", 72)
         events_days = getattr(retention, "events_days", 30)
+        usage_hours = getattr(retention, "usage_hours", 336)
+        speedtest_days = getattr(retention, "speedtest_days", 90)
         try:
             deleted = self._db.prune_old_data(
                 metrics_hours=metrics_hours,
                 events_days=events_days,
+                usage_hours=usage_hours,
+                speedtest_days=speedtest_days,
             )
             total = sum(deleted.values()) if isinstance(deleted, dict) else 0
             logger.info(
-                "Scheduled prune complete: %d rows removed (metrics>%sh, events>%sd)",
-                total, metrics_hours, events_days,
+                "Scheduled prune complete: %d rows removed (metrics>%sh, events>%sd, "
+                "usage>%sh, speedtest>%sd)",
+                total, metrics_hours, events_days, usage_hours, speedtest_days,
                 extra={"component": "watchdog"},
             )
         except Exception as exc:  # noqa: BLE001

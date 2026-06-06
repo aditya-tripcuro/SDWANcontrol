@@ -87,6 +87,31 @@ class RetentionConfig:
     metrics_hours: int
     events_days: int
     prune_interval_min: int
+    usage_hours: int = 336        # 14 days of 5s-cadence rx/tx samples
+    speedtest_days: int = 90      # speedtests are sparse, keep longer
+
+
+@dataclass(frozen=True)
+class SpeedtestConfig:
+    """
+    Hourly Ookla speedtest per interface. Off by default; opt-in per interface
+    either via ``enabled_interfaces`` here or via the UI toggle (DB state).
+
+    ``binary_path`` empty → auto-detect ``shutil.which("speedtest")``. If the
+    binary is missing the runner logs once and stays idle (graceful no-op).
+    """
+    enabled: bool = False
+    interval_sec: int = 3600
+    binary_path: str = ""
+    enabled_interfaces: tuple[str, ...] = ()
+    run_timeout_sec: int = 120
+
+
+@dataclass(frozen=True)
+class UsageConfig:
+    """Sample rx/tx byte counters from /proc/net/dev at a fixed cadence."""
+    enabled: bool = True
+    sample_interval_sec: int = 5
 
 
 @dataclass(frozen=True)
@@ -128,6 +153,11 @@ class AppConfig:
     heartbeat_file: str
     db_path: str
     log_dir: str
+    # Defaulted: keep existing positional callers working (especially tests
+    # that hand-construct AppConfig). Real loads always populate these via
+    # _parse_speedtest / _parse_usage.
+    speedtest: SpeedtestConfig = field(default_factory=SpeedtestConfig)
+    usage: UsageConfig = field(default_factory=UsageConfig)
 
     # Derived helpers
     @property
@@ -294,6 +324,37 @@ def _parse_retention(raw: dict) -> RetentionConfig:
         metrics_hours=int(_require_positive(raw, "metrics_hours", s)),
         events_days=int(_require_positive(raw, "events_days", s)),
         prune_interval_min=int(_require_positive(raw, "prune_interval_min", s)),
+        usage_hours=_optional_positive_int(raw, "usage_hours", s, 336),
+        speedtest_days=_optional_positive_int(raw, "speedtest_days", s, 90),
+    )
+
+
+def _parse_speedtest(raw: dict | None) -> SpeedtestConfig:
+    """Tolerant: an absent or empty block yields safe defaults (disabled)."""
+    if not raw:
+        return SpeedtestConfig()
+    s = "speedtest"
+    enabled_ifaces_raw = raw.get("enabled_interfaces", []) or []
+    if not isinstance(enabled_ifaces_raw, list):
+        raise ConfigError(f"[{s}].enabled_interfaces must be a list")
+    enabled_ifaces = tuple(str(x) for x in enabled_ifaces_raw)
+    binary_path = str(raw.get("binary_path", "") or "")
+    return SpeedtestConfig(
+        enabled=bool(raw.get("enabled", False)),
+        interval_sec=_optional_positive_int(raw, "interval_sec", s, 3600),
+        binary_path=binary_path,
+        enabled_interfaces=enabled_ifaces,
+        run_timeout_sec=_optional_positive_int(raw, "run_timeout_sec", s, 120),
+    )
+
+
+def _parse_usage(raw: dict | None) -> UsageConfig:
+    if not raw:
+        return UsageConfig()
+    s = "usage"
+    return UsageConfig(
+        enabled=bool(raw.get("enabled", True)),
+        sample_interval_sec=_optional_positive_int(raw, "sample_interval_sec", s, 5),
     )
 
 
@@ -370,6 +431,8 @@ def _parse(raw: dict) -> AppConfig:
         retention=_parse_retention(_require(raw, "retention")),
         alerting=_parse_alerting(raw.get("alerting", {"enabled": False})),
         server=_parse_server(_require(raw, "server")),
+        speedtest=_parse_speedtest(raw.get("speedtest")),
+        usage=_parse_usage(raw.get("usage")),
         lock_file=str(raw.get("lock_file", "/run/wancontrol/controller.lock")),
         heartbeat_file=str(raw.get("heartbeat_file", "/run/wancontrol/controller.heartbeat")),
         db_path=str(raw.get("db_path", "/var/lib/wancontrol/wan.db")),

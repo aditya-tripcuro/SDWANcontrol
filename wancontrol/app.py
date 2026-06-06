@@ -38,11 +38,13 @@ from flask import (
 from wancontrol import __version__
 from wancontrol.auth import Auth, AuthError, UserPrincipal
 from wancontrol.config import AppConfig, Config, ConfigError, VALID_WAN_MODES, _parse_interfaces
-from wancontrol.database import Database, MetricRow, UserRow
+from wancontrol.database import Database, MetricRow, SpeedtestRow, UsageRow, UserRow
 from wancontrol.network_discovery import DiscoveredInterface, discover_interfaces, generate_config_fragment_dict
 
 if TYPE_CHECKING:
     from wancontrol.controller import Controller
+    from wancontrol.speedtest import SpeedtestRunner
+    from wancontrol.usage import UsageSampler
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,8 @@ ROLE_REQUIREMENTS: dict[tuple[str, str], str] = {
     ("POST", "/api/control/resume"): "operator",
     ("POST", "/api/control/stop"): "operator",
     ("POST", "/api/control/kill"): "operator",
+    ("POST", "/api/speedtest/run"): "operator",
+    ("PATCH", "/api/speedtest/enabled"): "operator",
 }
 
 
@@ -266,6 +270,34 @@ def _metric_to_dict(m: MetricRow) -> dict[str, Any]:
         "dns_ok": bool(m.dns_ok),
         "http_ok": bool(m.http_ok),
         "score": m.score,
+    }
+
+
+def _speedtest_to_dict(s: SpeedtestRow) -> dict[str, Any]:
+    return {
+        "id": s.id,
+        "interface": s.interface,
+        "timestamp": s.timestamp,
+        "download_mbps": s.download_mbps,
+        "upload_mbps": s.upload_mbps,
+        "ping_ms": s.ping_ms,
+        "jitter_ms": s.jitter_ms,
+        "packet_loss_pct": s.packet_loss_pct,
+        "server_name": s.server_name,
+        "isp": s.isp,
+        "error": s.error,
+    }
+
+
+def _usage_to_dict(u: UsageRow) -> dict[str, Any]:
+    return {
+        "id": u.id,
+        "interface": u.interface,
+        "timestamp": u.timestamp,
+        "rx_mbps": u.rx_mbps,
+        "tx_mbps": u.tx_mbps,
+        "rx_bytes_total": u.rx_bytes_total,
+        "tx_bytes_total": u.tx_bytes_total,
     }
 
 
@@ -516,6 +548,138 @@ def get_latest_metrics() -> tuple[Response, int]:
     return jsonify(result), 200
 
 
+# ── Speedtest ─────────────────────────────────────────────────────────────────
+
+def _parse_query_window(default_limit: int) -> tuple[int, float | None, Response | None]:
+    """Parse the shared ?interface/?limit/?since query for history endpoints.
+
+    Returns (limit, since, error_response). When error_response is not None
+    the caller should return it immediately. The interface filter is read by
+    the caller directly via ``request.args.get("interface")``.
+    """
+    try:
+        limit = int(request.args.get("limit", default_limit))
+    except ValueError:
+        return 0, None, jsonify({"error": "bad_request", "message": "limit must be an integer."})
+    since: float | None = None
+    since_str = request.args.get("since")
+    if since_str:
+        try:
+            since = float(since_str)
+        except ValueError:
+            return 0, None, jsonify({"error": "bad_request", "message": "since must be a float."})
+    return limit, since, None
+
+
+@api_bp.route("/speedtest", methods=["GET"])
+def get_speedtests() -> tuple[Response, int]:
+    db: Database = current_app.config["DB"]
+    interface = request.args.get("interface") or None
+    limit, since, err = _parse_query_window(default_limit=100)
+    if err is not None:
+        return err, 400
+    rows = db.get_speedtests(interface=interface, limit=limit, since=since)
+    return jsonify([_speedtest_to_dict(r) for r in rows]), 200
+
+
+@api_bp.route("/speedtest/latest", methods=["GET"])
+def get_latest_speedtests() -> tuple[Response, int]:
+    cfg: AppConfig = current_app.config["CFG"]
+    db: Database = current_app.config["DB"]
+    result: dict[str, Any] = {}
+    for iface_cfg in cfg.interfaces:
+        row = db.get_latest_speedtest(iface_cfg.name)
+        result[iface_cfg.name] = _speedtest_to_dict(row) if row else None
+    return jsonify(result), 200
+
+
+@api_bp.route("/speedtest/enabled", methods=["GET"])
+def get_speedtest_enabled() -> tuple[Response, int]:
+    """Per-interface opt-in flags for the dashboard toggle."""
+    cfg: AppConfig = current_app.config["CFG"]
+    runner: "SpeedtestRunner | None" = current_app.config.get("SPEEDTEST_RUNNER")
+    if runner is None:
+        # No live runner (e.g. tests with stub controller only) — report whatever
+        # the YAML says so the UI can still render the panel.
+        enabled = set(cfg.speedtest.enabled_interfaces)
+    else:
+        enabled = runner.get_enabled()
+    return jsonify({iface.name: iface.name in enabled for iface in cfg.interfaces}), 200
+
+
+@api_bp.route("/speedtest/enabled", methods=["PATCH"])
+def patch_speedtest_enabled() -> tuple[Response, int]:
+    body = request.get_json(force=True, silent=True) or {}
+    interface = body.get("interface")
+    enabled = body.get("enabled")
+    if not isinstance(interface, str) or not interface:
+        return jsonify({
+            "error": "bad_request",
+            "message": "interface is required.",
+        }), 400
+    if not isinstance(enabled, bool):
+        return jsonify({
+            "error": "bad_request",
+            "message": "enabled must be a boolean.",
+        }), 400
+    cfg: AppConfig = current_app.config["CFG"]
+    if cfg.get_interface(interface) is None:
+        return jsonify({
+            "error": "not_found",
+            "message": f"unknown interface {interface!r}",
+        }), 404
+    runner: "SpeedtestRunner | None" = current_app.config.get("SPEEDTEST_RUNNER")
+    if runner is None:
+        return jsonify({
+            "error": "unavailable",
+            "message": "speedtest runner not configured",
+        }), 503
+    new_set = runner.set_enabled(interface, enabled)
+    return jsonify({
+        "interface": interface,
+        "enabled": enabled,
+        "enabled_set": sorted(new_set),
+    }), 200
+
+
+@api_bp.route("/speedtest/run", methods=["POST"])
+def post_speedtest_run() -> tuple[Response, int]:
+    body = request.get_json(force=True, silent=True) or {}
+    interface = body.get("interface")
+    if not isinstance(interface, str) or not interface:
+        return jsonify({
+            "error": "bad_request",
+            "message": "interface is required.",
+        }), 400
+    cfg: AppConfig = current_app.config["CFG"]
+    if cfg.get_interface(interface) is None:
+        return jsonify({
+            "error": "not_found",
+            "message": f"unknown interface {interface!r}",
+        }), 404
+    runner: "SpeedtestRunner | None" = current_app.config.get("SPEEDTEST_RUNNER")
+    if runner is None:
+        return jsonify({
+            "error": "unavailable",
+            "message": "speedtest runner not configured",
+        }), 503
+    runner.run_once(interface)
+    return jsonify({"queued": True, "interface": interface}), 202
+
+
+# ── Network usage (rx/tx throughput) ──────────────────────────────────────────
+
+@api_bp.route("/usage", methods=["GET"])
+def get_usage() -> tuple[Response, int]:
+    db: Database = current_app.config["DB"]
+    interface = request.args.get("interface") or None
+    limit, since, err = _parse_query_window(default_limit=720)
+    if err is not None:
+        return err, 400
+    rows = db.get_usage(interface=interface, limit=limit, since=since)
+    return jsonify([_usage_to_dict(r) for r in rows]), 200
+
+
 # ── Interface discovery ───────────────────────────────────────────────────────
 
 @api_bp.route("/interfaces/discover", methods=["GET"])
@@ -729,6 +893,7 @@ def sse_stream():
 
     def event_stream():
         last_alert_id = 0
+        last_speedtest_ids: dict[str, int] = {}
         while True:
             status = controller.get_status()
             yield f"event: status\ndata: {_json.dumps(status)}\n\n"
@@ -740,6 +905,24 @@ def sse_stream():
                 for iface in cfg.interfaces
             }
             yield f"event: metric\ndata: {_json.dumps(latest)}\n\n"
+
+            # Latest usage sample per interface (cheap; one row each).
+            usage_latest: dict[str, Any] = {}
+            for iface in cfg.interfaces:
+                rows = db.get_usage(interface=iface.name, limit=1)
+                usage_latest[iface.name] = _usage_to_dict(rows[0]) if rows else None
+            yield f"event: usage\ndata: {_json.dumps(usage_latest)}\n\n"
+
+            # Newest speedtest per interface — emit only when the ID changes so
+            # we don't spam the chart with the same row every 5s.
+            for iface in cfg.interfaces:
+                row = db.get_latest_speedtest(iface.name)
+                if row is None:
+                    continue
+                prev_id = last_speedtest_ids.get(iface.name)
+                if prev_id != row.id:
+                    last_speedtest_ids[iface.name] = row.id
+                    yield f"event: speedtest\ndata: {_json.dumps(_speedtest_to_dict(row))}\n\n"
 
             for alert in db.get_unnotified_alerts():
                 if alert.id > last_alert_id:
@@ -886,6 +1069,9 @@ def create_app(
     cfg_loader: Config,
     db: Database,
     controller: Controller,
+    *,
+    usage_sampler: "UsageSampler | None" = None,
+    speedtest_runner: "SpeedtestRunner | None" = None,
 ) -> Flask:
     app = Flask(__name__)
 
@@ -895,6 +1081,8 @@ def create_app(
     app.config["CONTROLLER"] = controller
     app.config["AUTH"] = Auth(db=db, server_cfg=cfg.server)
     app.config["STREAM_TICKETS"] = _StreamTicketStore()
+    app.config["USAGE_SAMPLER"] = usage_sampler
+    app.config["SPEEDTEST_RUNNER"] = speedtest_runner
 
     app.register_blueprint(api_bp)
 
